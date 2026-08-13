@@ -36,7 +36,7 @@ impl Form {
     fn blank_fields() -> Vec<Field> {
         vec![
             Field {
-                label: "Name (trigger, no spaces)",
+                label: "Alias (trigger, no spaces)",
                 value: String::new(),
                 required: true,
             },

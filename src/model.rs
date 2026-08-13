@@ -59,7 +59,7 @@ pub const DEFAULT_CATEGORY: &str = "general";
 /// A single managed alias or function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    /// The shell trigger the user types (e.g. `gitsw`). Unique across the store.
+    /// The shell alias the user types (e.g. `gitsw`). Unique across the store.
     pub name: String,
     pub kind: Kind,
     /// For an alias, the expansion. For a function, the body.
@@ -117,31 +117,31 @@ impl Entry {
         }
     }
 
-    /// Validate required fields and the shape of the trigger name.
+    /// Validate required fields and the shape of the trigger alias.
     ///
-    /// The name must be a usable shell trigger: non-empty, no whitespace, and
+    /// The alias must be a usable shell trigger: non-empty, no whitespace, and
     /// free of characters that would break an `alias`/function definition.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
-            return Err("name cannot be empty".into());
+            return Err("alias cannot be empty".into());
         }
         if self.name.chars().any(|c| c.is_whitespace()) {
-            return Err(format!("name '{}' cannot contain whitespace", self.name));
+            return Err(format!("alias '{}' cannot contain whitespace", self.name));
         }
-        // A trigger name must be a plain shell word. Allow letters, digits, and
+        // A trigger alias must be a plain shell word. Allow letters, digits, and
         // the small set of punctuation that is safe in an alias/function name.
         if let Some(bad) = self
             .name
             .chars()
             .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
         {
-            return Err(format!("name '{}' cannot contain '{bad}'", self.name));
+            return Err(format!("alias '{}' cannot contain '{bad}'", self.name));
         }
         if self.command.trim().is_empty() {
-            return Err(format!("entry '{}' must have a command", self.name));
+            return Err(format!("alias '{}' must have a command", self.name));
         }
         if self.description.trim().is_empty() {
-            return Err(format!("entry '{}' must have a description", self.name));
+            return Err(format!("alias '{}' must have a description", self.name));
         }
         Ok(())
     }

@@ -123,10 +123,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &UiState) {
     };
 
     let mut lines = vec![
-        field_line("name", &entry.name),
+        field_line("alias", &entry.name),
         Line::from(vec![
             Span::styled("kind      ", label_style()),
-            Span::styled(entry.kind.to_string(), Style::default().fg(kind_color(entry.kind))),
+            Span::styled(
+                entry.kind.to_string(),
+                Style::default().fg(kind_color(entry.kind)),
+            ),
         ]),
         field_line("category", &entry.category),
     ];

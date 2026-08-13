@@ -69,7 +69,7 @@ enum Command {
 
 #[derive(Args)]
 struct AddArgs {
-    /// The trigger the user will type (e.g. gitsw).
+    /// The alias the user will type (e.g. gitsw).
     name: String,
     #[arg(long, short = 'c')]
     command: Option<String>,
@@ -107,7 +107,7 @@ struct EditArgs {
     tags: Vec<String>,
     #[arg(long)]
     usage: Option<String>,
-    /// New name for the entry.
+    /// New alias for the entry.
     #[arg(long)]
     rename: Option<String>,
     /// Do not auto-fill empty description/usage/options/examples from --help.
@@ -190,7 +190,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
 
 fn cmd_new() -> Result<()> {
     let mut app = App::load()?;
-    let name = prompt_required("Name")?;
+    let name = prompt_required("Alias")?;
     let kind = loop {
         let raw = prompt("Kind [alias/function] (alias)");
         let raw = if raw.trim().is_empty() {
