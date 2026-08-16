@@ -1,1 +1,7 @@
 /target
+default.profraw
+.claude/local
+.claude/settings.local.json
+.devin/
+
+*.local.*
