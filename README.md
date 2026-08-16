@@ -19,7 +19,8 @@ aliases and functions. Entries you add become real shell definitions, so a store
 - Safe example-output capture: commands run in a hard-timeboxed, auto-killed
   process wrapped in a filesystem/network sandbox, and output is sanitized before
   it is stored.
-- Regular backup and restore to a private GitHub `cmd-man-backup` repository.
+- Automatic background sync, plus manual backup and restore, to a private GitHub
+  `cmd-man-backup` repository.
 
 ## Requirements
 
@@ -28,7 +29,13 @@ aliases and functions. Entries you add become real shell definitions, so a store
 
 ## Install
 
-Build from source with Cargo:
+Install directly from GitHub with Cargo (no clone needed):
+
+```sh
+cargo install --git https://github.com/brennacodes/cmd-man.git
+```
+
+Or build from a local clone (for development):
 
 ```sh
 cargo install --path .
@@ -93,7 +100,7 @@ cmd-man edit gitsw --desc "switch or create branches"
 cmd-man rm gitsw
 
 # Capture example output for an entry
-cmd-man capture gitsw
+cmd-man capture <alias>
 
 # Import aliases and functions already active in your shell
 cmd-man import
@@ -139,6 +146,30 @@ overwrites text you already entered. In the TUI add/edit form, press `Ctrl-F` to
 fetch on demand and review before saving. Pass `--no-help` to `add`/`edit`, or
 leave the fields populated, to skip the lookup. Commands whose help does not
 follow recognizable sections simply leave the fields blank for you to fill in.
+
+## Automatic sync
+
+Once a backup remote is reachable, cmd-man keeps your entries synced automatically,
+with no manual step. In a short-lived background process that never blocks you, it
+pulls the latest on every invocation and commits and pushes whenever you add, edit,
+remove, or capture an entry.
+
+A remote is reachable when any of these holds, preferred in this order:
+
+1. `backup.remote_url` is set in your config.
+2. `gh` is installed and authenticated. A private `cmd-man-backup` repository is
+   created for you on the first push.
+3. A GitHub OAuth token is already stored (see Backups below).
+
+On a new machine where the remote is reachable, the first run clones your existing
+backup and regenerates your shell files, so your aliases and functions travel with
+you with zero setup. This clone only happens when your local store is empty, so it
+never overwrites entries you created locally first.
+
+Automatic sync is on by default. Turn it off with `auto_sync = false` under
+`[backup]` in `~/.config/cmd-man/config.toml`, or set `CMD_MAN_DISABLE_SYNC=1` to
+disable it for a single run. If a sync cannot reach the remote, cmd-man prints a
+one-line notice on your next command and retries then; your work is never blocked.
 
 ## Backups
 
