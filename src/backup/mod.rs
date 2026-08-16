@@ -4,6 +4,7 @@
 pub mod git;
 pub mod oauth;
 pub mod plan;
+mod sync;
 
 use std::process::Command;
 
@@ -14,6 +15,10 @@ use crate::paths::Paths;
 
 use git::GitRepo;
 pub use plan::{Availability, BackupPlan, new_repo_link, plan_backup, remote_https_url};
+pub use sync::{
+    SYNC_EXEC_ARG, SyncStatus, read_status, run_sync, spawn_sync, sync_exec_main,
+    take_failure_notice,
+};
 
 /// Human-facing outcome of a backup run.
 #[derive(Debug)]
@@ -44,7 +49,14 @@ pub fn prepare_repo(paths: &Paths) -> Result<GitRepo> {
     paths.ensure_dirs()?;
     let repo = GitRepo::new(paths.root().clone());
     repo.init()?;
-    repo.ensure_gitignore(&["shell/", ".DS_Store"])?;
+    repo.ensure_gitignore(&[
+        "shell/",
+        ".DS_Store",
+        ".sync.lock",
+        ".sync-state.toml",
+        ".sync-notified",
+        ".sync-clone/",
+    ])?;
     Ok(repo)
 }
 

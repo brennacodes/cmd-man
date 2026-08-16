@@ -58,6 +58,9 @@ pub struct BackupConfig {
     pub remote_url: Option<String>,
     /// Name of the backup repository.
     pub repo_name: String,
+    /// Automatically pull on invocation and commit+push on every change, in a
+    /// detached background process, whenever a remote is resolvable.
+    pub auto_sync: bool,
 }
 
 impl Default for BackupConfig {
@@ -68,6 +71,7 @@ impl Default for BackupConfig {
             disable_oauth: false,
             remote_url: None,
             repo_name: "cmd-man-backup".to_string(),
+            auto_sync: true,
         }
     }
 }
@@ -127,6 +131,7 @@ mod tests {
         assert_eq!(c.capture.timeout_secs, 10);
         assert_eq!(c.backup.repo_name, "cmd-man-backup");
         assert!(c.backup.method.is_none());
+        assert!(c.backup.auto_sync);
     }
 
     #[test]
@@ -148,5 +153,16 @@ mod tests {
         assert_eq!(c.capture.timeout_secs, 30);
         assert!(c.capture.sandbox);
         assert!(c.shells.zsh);
+        // A config that predates auto_sync still opts in by default.
+        assert!(c.backup.auto_sync);
+    }
+
+    #[test]
+    fn auto_sync_round_trips_and_can_be_disabled() {
+        let mut c = Config::default();
+        c.backup.auto_sync = false;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(!back.backup.auto_sync);
     }
 }

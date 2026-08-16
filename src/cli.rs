@@ -9,6 +9,7 @@ use crate::app::{App, now_timestamp};
 use crate::backup;
 use crate::capture;
 use crate::model::{Entry, Kind};
+use crate::paths::Paths;
 use crate::search::Filter;
 use crate::shell::{self, Shell};
 
@@ -118,10 +119,26 @@ struct EditArgs {
 /// Parse arguments and run the requested command (or the TUI).
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let paths = Paths::resolve().ok();
+
+    // Report a previous background sync failure once, without blocking anything.
+    if let Some(paths) = &paths
+        && let Some(notice) = backup::take_failure_notice(paths)
+    {
+        eprintln!("{notice}");
+    }
+
+    let result = match cli.command {
         None => crate::tui::run(),
         Some(cmd) => dispatch(cmd),
+    };
+
+    // Kick off this invocation's sync after the command has settled on disk, so a
+    // single background pass covers the pull and any pushes from this run.
+    if let Some(paths) = &paths {
+        backup::spawn_sync(paths);
     }
+    result
 }
 
 fn dispatch(cmd: Command) -> Result<()> {

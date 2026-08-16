@@ -53,6 +53,21 @@ impl Paths {
         self.shell_dir().join(shell.filename())
     }
 
+    /// Lock file guarding a single background sync at a time.
+    pub fn sync_lock_file(&self) -> PathBuf {
+        self.root.join(".sync.lock")
+    }
+
+    /// State file recording the outcome of the last background sync.
+    pub fn sync_state_file(&self) -> PathBuf {
+        self.root.join(".sync-state.toml")
+    }
+
+    /// Marker recording which sync failure has already been surfaced.
+    pub fn sync_notified_file(&self) -> PathBuf {
+        self.root.join(".sync-notified")
+    }
+
     /// Create the data, categories, and shell directories if missing.
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(self.categories_dir())
@@ -84,6 +99,15 @@ mod tests {
         assert_eq!(
             p.shell_file(Shell::Bash),
             PathBuf::from("/tmp/cm/shell/cmd-man.bash")
+        );
+        assert_eq!(p.sync_lock_file(), PathBuf::from("/tmp/cm/.sync.lock"));
+        assert_eq!(
+            p.sync_state_file(),
+            PathBuf::from("/tmp/cm/.sync-state.toml")
+        );
+        assert_eq!(
+            p.sync_notified_file(),
+            PathBuf::from("/tmp/cm/.sync-notified")
         );
     }
 }

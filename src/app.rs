@@ -42,10 +42,13 @@ impl App {
         }
     }
 
-    /// Persist the store and regenerate the enabled shell files.
+    /// Persist the store and regenerate the enabled shell files, then kick off a
+    /// background sync so the change is committed and pushed.
     pub fn persist(&self) -> Result<()> {
         self.store.save(&self.paths)?;
-        self.regenerate_shells()
+        self.regenerate_shells()?;
+        crate::backup::spawn_sync(&self.paths);
+        Ok(())
     }
 
     /// Regenerate shell definition files for enabled shells.

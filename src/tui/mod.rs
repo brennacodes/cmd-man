@@ -16,6 +16,8 @@ use state::{Action, ConfirmKind, Mode, UiState};
 /// Launch the TUI event loop.
 pub fn run() -> Result<()> {
     let mut app = App::load()?;
+    // Pull the latest at launch; mid-session mutations sync via App::persist.
+    backup::spawn_sync(&app.paths);
     let mut state = UiState::new(app.store.entries().to_vec());
     let mut form: Option<Form> = None;
 

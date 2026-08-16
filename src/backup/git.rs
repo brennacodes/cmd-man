@@ -113,11 +113,65 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Pull the latest from `remote`/`branch` (fast-forward only is not enforced).
+    /// Pull the latest from `remote`/`branch`. Always non-interactive: a merge
+    /// strategy is forced so a background process never stops for input, and
+    /// unrelated histories are allowed so a first multi-machine sync reconciles.
     pub fn pull(&self, remote: &str, branch: &str) -> Result<()> {
-        self.run(&["pull", remote, branch])?;
+        self.run(&[
+            "pull",
+            "--no-rebase",
+            "--no-edit",
+            "--allow-unrelated-histories",
+            remote,
+            branch,
+        ])?;
         Ok(())
     }
+
+    /// Pull the latest from an explicit URL (used when credentials must be
+    /// embedded for a one-shot authenticated fetch). Non-interactive like [`pull`].
+    pub fn pull_url(&self, url: &str, branch: &str) -> Result<()> {
+        self.run(&[
+            "pull",
+            "--no-rebase",
+            "--no-edit",
+            "--allow-unrelated-histories",
+            url,
+            branch,
+        ])?;
+        Ok(())
+    }
+
+    /// The current `HEAD` commit hash, if the repo has any commits.
+    pub fn head_commit(&self) -> Option<String> {
+        self.run(&["rev-parse", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Abort an in-progress merge, leaving the working tree as it was.
+    pub fn abort_merge(&self) -> Result<()> {
+        self.run(&["merge", "--abort"])?;
+        Ok(())
+    }
+
+    /// Reset the working tree to `HEAD`, restoring tracked files.
+    pub fn reset_hard(&self) -> Result<()> {
+        self.run(&["reset", "--hard", "HEAD"])?;
+        Ok(())
+    }
+}
+
+/// Whether a remote URL already has any refs (i.e. contains commits). A command
+/// failure (missing repo, offline) is reported as "no content" so callers fall
+/// back to initializing and pushing rather than treating it as fatal.
+pub fn remote_has_content(url: &str) -> bool {
+    Command::new("git")
+        .args(["ls-remote", url])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Clone `url` into `dest`.
@@ -172,6 +226,43 @@ mod tests {
             repo.remote_url("origin").as_deref(),
             Some("https://example.com/y.git")
         );
+    }
+
+    #[test]
+    fn remote_has_content_reflects_refs() {
+        let bare = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(bare.path())
+            .output()
+            .unwrap();
+        let bare_url = bare.path().to_str().unwrap();
+        // An empty bare repo has no refs.
+        assert!(!remote_has_content(bare_url));
+
+        // A missing path is treated as no content, not an error.
+        assert!(!remote_has_content("/no/such/repo"));
+
+        // After a push it reports content.
+        let work = tempfile::tempdir().unwrap();
+        let repo = configured_repo(work.path());
+        std::fs::write(work.path().join("a.toml"), "x = 1\n").unwrap();
+        repo.commit_all("first").unwrap();
+        repo.set_remote("origin", bare_url).unwrap();
+        repo.push("origin", "main").unwrap();
+        assert!(remote_has_content(bare_url));
+    }
+
+    #[test]
+    fn reset_hard_restores_tracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = configured_repo(dir.path());
+        let file = dir.path().join("a.toml");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        repo.commit_all("first").unwrap();
+        std::fs::write(&file, "x = 999\n").unwrap();
+        repo.reset_hard().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
     }
 
     #[test]

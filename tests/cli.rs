@@ -10,7 +10,9 @@ fn cmd(home: &TempDir) -> Command {
     c.env("HOME", home.path())
         .env("CMD_MAN_HOME", home.path().join("store"))
         // Ensure a predictable shell for import/hint logic.
-        .env("SHELL", "/bin/zsh");
+        .env("SHELL", "/bin/zsh")
+        // Never let the background sync run against a real remote from tests.
+        .env("CMD_MAN_DISABLE_SYNC", "1");
     c
 }
 

@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use wait_timeout::ChildExt;
 
 use crate::config::CaptureConfig;
+use crate::proc::own_process_group;
 
 use super::sanitize::sanitize;
 
@@ -143,17 +144,6 @@ fn finish(mut child: Child, timeout: Duration, backend: &'static str) -> Result<
         exit_code: code,
     })
 }
-
-/// Make a command start its own process group so its whole subtree can be
-/// signalled together.
-#[cfg(unix)]
-fn own_process_group(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn own_process_group(_cmd: &mut Command) {}
 
 /// Kill a child that leads its own process group, reaping its descendants.
 #[cfg(unix)]
