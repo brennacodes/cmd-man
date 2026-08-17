@@ -1,4 +1,4 @@
-# Command Man (cmd-man)
+# Command Man (`cmd-man`)
 
 Command Man is an interactive CLI for creating, browsing, and managing your shell
 aliases and functions. Entries you add become real shell definitions, so a stored
