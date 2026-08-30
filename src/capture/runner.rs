@@ -2,6 +2,7 @@
 //! the sandbox in a dedicated process, and every run is hard-timeboxed.
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ pub const CAPTURE_CMD_ENV: &str = "CMD_MAN_CAPTURE_CMD";
 pub const CAPTURE_SANDBOX_ENV: &str = "CMD_MAN_CAPTURE_SANDBOX";
 /// Env var carrying the inner timeout in seconds.
 pub const CAPTURE_TIMEOUT_ENV: &str = "CMD_MAN_CAPTURE_TIMEOUT";
+/// Env var carrying the working directory the captured command runs in.
+pub const CAPTURE_CWD_ENV: &str = "CMD_MAN_CAPTURE_CWD";
 /// Argv marker selecting the hidden capture-exec subcommand.
 pub const CAPTURE_EXEC_ARG: &str = "__capture-exec";
 
@@ -41,35 +44,55 @@ pub struct CaptureResult {
     pub exit_code: Option<i32>,
 }
 
-/// Capture output for a command line, honoring the configured sandbox + timeout.
-pub fn run_capture(cfg: &CaptureConfig, command: &str) -> Result<CaptureResult> {
+/// Capture output for a command line, honoring the configured sandbox +
+/// timeout. `cwd` is the directory the command runs in, defaulting to the
+/// process working directory.
+pub fn run_capture(
+    cfg: &CaptureConfig,
+    command: &str,
+    cwd: Option<&Path>,
+) -> Result<CaptureResult> {
     let timeout = Duration::from_secs(cfg.timeout_secs.max(1));
     if cfg.sandbox {
-        match run_via_helper(command, timeout, true) {
+        match run_via_helper(command, timeout, true, cwd) {
             Ok(result) => Ok(result),
             // Sandbox setup can fail (unsupported platform, re-exec issues);
             // fall back to the always-available timeboxed subprocess.
-            Err(_) => run_plain(command, timeout),
+            Err(_) => run_plain(command, timeout, cwd),
         }
     } else {
-        run_plain(command, timeout)
+        run_plain(command, timeout, cwd)
     }
 }
 
 /// Run a command directly in a timeboxed subprocess (no sandbox).
-pub fn run_plain(command: &str, timeout: Duration) -> Result<CaptureResult> {
+pub fn run_plain(command: &str, timeout: Duration, cwd: Option<&Path>) -> Result<CaptureResult> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    set_cwd(&mut cmd, cwd);
     own_process_group(&mut cmd);
     let child = cmd.spawn().context("spawning capture subprocess")?;
     finish(child, timeout, "subprocess")
 }
 
-fn run_via_helper(command: &str, timeout: Duration, sandbox: bool) -> Result<CaptureResult> {
+/// Point a shell at `cwd`, keeping `PWD` in step the way a real `cd` does so
+/// the command sees the same directory however it asks for it.
+fn set_cwd(cmd: &mut Command, cwd: Option<&Path>) {
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir).env("PWD", dir);
+    }
+}
+
+fn run_via_helper(
+    command: &str,
+    timeout: Duration,
+    sandbox: bool,
+    cwd: Option<&Path>,
+) -> Result<CaptureResult> {
     let exe = std::env::current_exe().context("resolving current executable")?;
     let mut cmd = Command::new(exe);
     cmd.arg(CAPTURE_EXEC_ARG)
@@ -79,6 +102,16 @@ fn run_via_helper(command: &str, timeout: Duration, sandbox: bool) -> Result<Cap
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The helper reads the directory back out of the environment and applies it
+    // to the shell it spawns; setting it here alone would be a no-op.
+    match cwd {
+        Some(dir) => {
+            cmd.env(CAPTURE_CWD_ENV, dir);
+        }
+        None => {
+            cmd.env_remove(CAPTURE_CWD_ENV);
+        }
+    }
     own_process_group(&mut cmd);
     let child = cmd.spawn().context("spawning capture helper")?;
     // The helper enforces the real timeout on its child; the parent adds a
@@ -168,7 +201,7 @@ pub fn gather_intel(binary: &str) -> Option<String> {
         return None;
     }
     for flag in ["--help", "-h"] {
-        if let Ok(result) = run_plain(&format!("{binary} {flag}"), Duration::from_secs(5)) {
+        if let Ok(result) = run_plain(&format!("{binary} {flag}"), Duration::from_secs(5), None) {
             let trimmed = result.output.trim();
             if !trimmed.is_empty() {
                 return Some(first_lines(trimmed, 15));
@@ -192,17 +225,26 @@ pub fn capture_exec_main() -> ! {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(10);
-    let code = exec_inner(&command, sandbox, Duration::from_secs(timeout.max(1)));
+    let cwd = std::env::var_os(CAPTURE_CWD_ENV)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    let code = exec_inner(
+        &command,
+        sandbox,
+        Duration::from_secs(timeout.max(1)),
+        cwd.as_deref(),
+    );
     std::process::exit(code);
 }
 
-fn exec_inner(command: &str, sandbox: bool, timeout: Duration) -> i32 {
+fn exec_inner(command: &str, sandbox: bool, timeout: Duration, cwd: Option<&Path>) -> i32 {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    set_cwd(&mut cmd, cwd);
     own_process_group(&mut cmd);
 
     let spawned = if sandbox {
@@ -297,7 +339,7 @@ mod tests {
 
     #[test]
     fn plain_capture_gets_output() {
-        let r = run_plain("echo hello", Duration::from_secs(5)).unwrap();
+        let r = run_plain("echo hello", Duration::from_secs(5), None).unwrap();
         assert!(r.output.contains("hello"));
         assert!(r.success);
         assert!(!r.timed_out);
@@ -306,13 +348,13 @@ mod tests {
 
     #[test]
     fn plain_capture_includes_stderr() {
-        let r = run_plain("echo oops 1>&2", Duration::from_secs(5)).unwrap();
+        let r = run_plain("echo oops 1>&2", Duration::from_secs(5), None).unwrap();
         assert!(r.output.contains("oops"));
     }
 
     #[test]
     fn timeout_kills_long_command() {
-        let r = run_plain("sleep 5", Duration::from_secs(1)).unwrap();
+        let r = run_plain("sleep 5", Duration::from_secs(1), None).unwrap();
         assert!(r.timed_out);
         assert!(!r.success);
     }

@@ -882,3 +882,34 @@ fn scope_relocate_rejects_a_reserved_or_unsafe_id() {
         .success()
         .stdout(predicate::str::contains("No scopes."));
 }
+
+#[test]
+fn capture_of_a_scoped_entry_runs_in_the_scope_directory() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, &api)
+        .args([
+            "add",
+            "where",
+            "-c",
+            "pwd",
+            "--desc",
+            "where am i",
+            "--here",
+        ])
+        .assert()
+        .success();
+
+    // Run capture from somewhere else entirely.
+    cmd_in(&home, home.path())
+        .args(["capture", "where", "--in", "api"])
+        .assert()
+        .success();
+
+    let toml = std::fs::read_to_string(store_dir(&home).join("categories/general.toml")).unwrap();
+    // Sanitization rewrites the home prefix, so the scope-relative tail is what
+    // distinguishes a run inside the scope from one in the process directory.
+    assert!(toml.contains("work/api"), "expected work/api in: {toml}");
+}

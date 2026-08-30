@@ -134,7 +134,7 @@ pub fn fetch_help(cfg: &CaptureConfig, command: &str) -> HelpSections {
     };
     let mut merged = HelpSections::default();
     for invocation in help_invocations(command).into_iter().take(3) {
-        if let Ok(result) = run_capture(&help_cfg, &invocation) {
+        if let Ok(result) = run_capture(&help_cfg, &invocation, None) {
             let parsed = parse_help(&result.output);
             merge_empty(&mut merged, parsed);
             if !merged.usage.is_empty()

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
-use crate::app::{App, Selection, now_timestamp};
+use crate::app::{App, CaptureCwd, Selection, now_timestamp};
 use crate::backup;
 use crate::capture;
 use crate::model::{Entry, EntryKey, Kind};
@@ -559,6 +559,13 @@ fn do_capture(app: &mut App, key: &EntryKey, yes: bool) -> Result<()> {
             println!("Skipped.");
             return Ok(());
         }
+    }
+
+    if let CaptureCwd::MissingScopeDir(dir) = app.capture_cwd(&entry) {
+        println!(
+            "Scope directory {} does not exist here; running in the current directory.",
+            dir.display()
+        );
     }
 
     let result = app.capture(&entry)?;

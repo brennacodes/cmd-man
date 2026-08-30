@@ -44,6 +44,18 @@ pub struct ScopeSummary {
     pub inactive_via_symlink: Option<PathBuf>,
 }
 
+/// Where an entry's example output is captured from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureCwd {
+    /// Run in the process working directory.
+    Inherit,
+    /// Run in this directory.
+    In(PathBuf),
+    /// The scope directory does not exist here; run in the process working
+    /// directory.
+    MissingScopeDir(PathBuf),
+}
+
 /// Loaded application state.
 pub struct App {
     pub paths: Paths,
@@ -465,9 +477,30 @@ impl App {
         capture::classify(entry)
     }
 
+    /// Where an entry's capture runs. A scoped command usually only makes
+    /// sense inside its own directory, so that is where it is run from.
+    pub fn capture_cwd(&self, entry: &Entry) -> CaptureCwd {
+        let Some(dir) = entry
+            .scope
+            .as_deref()
+            .and_then(|id| self.scopes.resolved_path(id))
+        else {
+            return CaptureCwd::Inherit;
+        };
+        if dir.is_dir() {
+            CaptureCwd::In(dir)
+        } else {
+            CaptureCwd::MissingScopeDir(dir)
+        }
+    }
+
     /// Run the capture pipeline for an entry (does not persist).
     pub fn capture(&self, entry: &Entry) -> Result<CaptureResult> {
-        capture::run_capture(&self.config.capture, &entry.command)
+        let cwd = match self.capture_cwd(entry) {
+            CaptureCwd::In(dir) => Some(dir),
+            CaptureCwd::Inherit | CaptureCwd::MissingScopeDir(_) => None,
+        };
+        capture::run_capture(&self.config.capture, &entry.command, cwd.as_deref())
     }
 
     /// Fetch parsed help sections for a command.
@@ -1301,6 +1334,42 @@ mod tests {
             app.notices().iter().any(|n| n.contains("duplicate scope")),
             "notices were: {:?}",
             app.notices()
+        );
+    }
+
+    #[test]
+    fn capture_cwd_follows_the_scope_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let canonical = api.canonicalize().unwrap();
+        let mut app = test_app(&dir).with_cwd(canonical.clone());
+        let key = app
+            .add(Entry::new("dep", Kind::Alias, "pwd", "d"), &Placement::Here)
+            .unwrap();
+        let entry = app.store.find(&key).unwrap().clone();
+        assert_eq!(app.capture_cwd(&entry), CaptureCwd::In(canonical));
+
+        let global = Entry::new("g", Kind::Alias, "pwd", "d");
+        assert_eq!(app.capture_cwd(&global), CaptureCwd::Inherit);
+    }
+
+    #[test]
+    fn capture_cwd_reports_a_missing_scope_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let mut app = App::with(paths, Config::default(), Store::default());
+        app.scopes.insert(Scope {
+            id: "gone".into(),
+            path: "/no/such/dir".into(),
+            created_at: "t".into(),
+        });
+        let mut entry = Entry::new("x", Kind::Alias, "pwd", "d");
+        entry.scope = Some("gone".into());
+        assert_eq!(
+            app.capture_cwd(&entry),
+            CaptureCwd::MissingScopeDir(PathBuf::from("/no/such/dir"))
         );
     }
 }
