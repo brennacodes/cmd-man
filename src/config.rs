@@ -13,6 +13,7 @@ pub struct Config {
     pub shells: ShellConfig,
     pub backup: BackupConfig,
     pub capture: CaptureConfig,
+    pub scope: ScopeConfig,
 }
 
 /// Which shells receive generated definitions.
@@ -95,6 +96,49 @@ impl Default for CaptureConfig {
     }
 }
 
+/// Where a new entry is placed when the command line says nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeDefault {
+    /// Place the entry globally.
+    Global,
+    /// Place the entry in the enclosing repository, when there is one.
+    Repo,
+}
+
+/// Directory-scope settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScopeConfig {
+    /// Default placement for a new entry, either `global` or `repo`. Kept as a
+    /// string so an unrecognized value falls back instead of failing the load.
+    pub default: String,
+}
+
+impl Default for ScopeConfig {
+    fn default() -> Self {
+        ScopeConfig {
+            default: "global".to_string(),
+        }
+    }
+}
+
+impl ScopeConfig {
+    /// Returns the effective mode and, when the configured value is not
+    /// recognized, a notice describing the fallback.
+    pub fn resolve(&self) -> (ScopeDefault, Option<String>) {
+        match self.default.as_str() {
+            "global" => (ScopeDefault::Global, None),
+            "repo" => (ScopeDefault::Repo, None),
+            other => (
+                ScopeDefault::Global,
+                Some(format!(
+                    "config: unknown scope.default '{other}', using 'global'"
+                )),
+            ),
+        }
+    }
+}
+
 impl Config {
     /// Load configuration, returning defaults when no file exists yet.
     pub fn load(paths: &Paths) -> Result<Self> {
@@ -155,6 +199,39 @@ mod tests {
         assert!(c.shells.zsh);
         // A config that predates auto_sync still opts in by default.
         assert!(c.backup.auto_sync);
+        assert_eq!(c.scope.default, "global");
+    }
+
+    #[test]
+    fn scope_config_defaults_to_global() {
+        let cfg = Config::default();
+        assert_eq!(cfg.scope.default, "global");
+        assert_eq!(cfg.scope.resolve(), (ScopeDefault::Global, None));
+    }
+
+    #[test]
+    fn scope_config_accepts_repo() {
+        let cfg: Config = toml::from_str("[scope]\ndefault = \"repo\"\n").unwrap();
+        assert_eq!(cfg.scope.resolve(), (ScopeDefault::Repo, None));
+    }
+
+    #[test]
+    fn an_invalid_scope_default_falls_back_with_a_notice() {
+        let cfg: Config = toml::from_str("[scope]\ndefault = \"nonsense\"\n").unwrap();
+        let (mode, notice) = cfg.scope.resolve();
+        assert_eq!(mode, ScopeDefault::Global);
+        assert!(notice.unwrap().contains("nonsense"));
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            text.contains("nonsense"),
+            "the raw value must survive a round trip: {text}"
+        );
+    }
+
+    #[test]
+    fn a_config_predating_scopes_loads_as_global() {
+        let cfg: Config = toml::from_str("[shells]\nzsh = true\n").unwrap();
+        assert_eq!(cfg.scope.resolve(), (ScopeDefault::Global, None));
     }
 
     #[test]
