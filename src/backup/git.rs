@@ -75,9 +75,7 @@ impl GitRepo {
         if !self.has_changes_staged()? {
             return Ok(false);
         }
-        // Signing is forced off: the backup repo is a machine-generated mirror
-        // and the detached sync process has no tty for a passphrase prompt.
-        self.run(&["-c", "commit.gpgsign=false", "commit", "-m", message])?;
+        self.run(&["commit", "-m", message])?;
         Ok(true)
     }
 
@@ -228,18 +226,6 @@ mod tests {
             repo.remote_url("origin").as_deref(),
             Some("https://example.com/y.git")
         );
-    }
-
-    #[test]
-    fn a_commit_succeeds_for_a_user_who_signs_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = configured_repo(dir.path());
-        repo.run(&["config", "commit.gpgsign", "true"]).unwrap();
-        repo.run(&["config", "gpg.program", "/nonexistent/gpg"])
-            .unwrap();
-
-        std::fs::write(dir.path().join("a.toml"), "x = 1\n").unwrap();
-        assert!(repo.commit_all("first").unwrap());
     }
 
     #[test]
