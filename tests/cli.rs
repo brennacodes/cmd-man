@@ -613,3 +613,88 @@ fn edit_move_to_an_unknown_scope_errors() {
         }
     );
 }
+
+#[test]
+fn list_defaults_to_entries_active_in_this_directory() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, home.path())
+        .args(["add", "globalone", "-c", "echo global-one", "--desc", "g"])
+        .assert()
+        .success();
+    cmd_in(&home, &api)
+        .args([
+            "add",
+            "scopedone",
+            "-c",
+            "echo scoped-one",
+            "--desc",
+            "s",
+            "--here",
+        ])
+        .assert()
+        .success();
+
+    cmd_in(&home, home.path())
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo global-one"))
+        .stdout(predicate::str::contains("echo scoped-one").not());
+
+    cmd_in(&home, &api)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scopedone (api)"))
+        .stdout(predicate::str::contains("echo global-one"));
+
+    cmd_in(&home, home.path())
+        .args(["list", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo scoped-one"))
+        .stdout(predicate::str::contains("echo global-one"));
+
+    cmd_in(&home, home.path())
+        .args(["list", "--in", "api"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo scoped-one"))
+        .stdout(predicate::str::contains("echo global-one").not());
+
+    cmd_in(&home, &api)
+        .args(["list", "--in", "global"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo global-one"))
+        .stdout(predicate::str::contains("echo scoped-one").not());
+}
+
+#[test]
+fn search_finds_entries_from_every_scope() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, &api)
+        .args([
+            "add",
+            "deployer",
+            "-c",
+            "echo deploy",
+            "--desc",
+            "d",
+            "--here",
+        ])
+        .assert()
+        .success();
+
+    cmd_in(&home, home.path())
+        .args(["search", "deploy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deployer (api)"));
+}

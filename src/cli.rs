@@ -11,7 +11,7 @@ use crate::capture;
 use crate::model::{Entry, EntryKey, Kind};
 use crate::paths::Paths;
 use crate::scopes::Placement;
-use crate::search::Filter;
+use crate::search::{Filter, ScopeFilter};
 use crate::shell::{self, Shell};
 
 #[derive(Parser)]
@@ -36,12 +36,20 @@ enum Command {
         /// Words to search for.
         query: Vec<String>,
     },
-    /// List stored entries, optionally filtered.
+    /// List stored entries, optionally filtered. Defaults to the entries that
+    /// are live in the current directory.
+    #[command(group = ArgGroup::new("scope_filter").multiple(false))]
     List {
         #[arg(long)]
         category: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        /// List entries from every scope, not just the live ones.
+        #[arg(long, group = "scope_filter")]
+        all: bool,
+        /// List only the entries in this scope id, or `global` for unscoped ones.
+        #[arg(long = "in", value_name = "ID", group = "scope_filter")]
+        in_scope: Option<String>,
     },
     /// Edit fields of an existing entry.
     Edit(EditArgs),
@@ -209,7 +217,12 @@ fn dispatch(cmd: Command) -> Result<()> {
         Command::Add(args) => cmd_add(args),
         Command::New => cmd_new(),
         Command::Search { query } => cmd_search(&query.join(" ")),
-        Command::List { category, kind } => cmd_list(category, kind),
+        Command::List {
+            category,
+            kind,
+            all,
+            in_scope,
+        } => cmd_list(category, kind, all, in_scope),
         Command::Edit(args) => cmd_edit(args),
         Command::Rm { name, selection } => cmd_rm(&name, &selection),
         Command::Capture {
@@ -355,13 +368,19 @@ fn cmd_new() -> Result<()> {
 
 fn cmd_search(query: &str) -> Result<()> {
     let app = load_app()?;
-    let results = app.search(query, &Filter::default());
+    // Search spans every scope so a name is never impossible to find from the
+    // wrong directory.
+    let filter = Filter {
+        scope: ScopeFilter::All,
+        ..Filter::default()
+    };
+    let results = app.search(query, &filter);
     if results.is_empty() {
         println!("No matches.");
         return Ok(());
     }
     for e in results {
-        println!("{}  [{}]  {}", e.name, e.kind, e.command);
+        println!("{}  [{}]  {}", EntryKey::of(e).label(), e.kind, e.command);
         if !e.description.is_empty() {
             println!("    {}", e.description);
         }
@@ -369,14 +388,39 @@ fn cmd_search(query: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
+fn cmd_list(
+    category: Option<String>,
+    kind: Option<String>,
+    all: bool,
+    in_scope: Option<String>,
+) -> Result<()> {
     let app = load_app()?;
+    let scope = if all {
+        ScopeFilter::All
+    } else if let Some(id) = in_scope {
+        match id.as_str() {
+            "global" => ScopeFilter::Only(None),
+            _ if app.scopes.find(&id).is_none() => {
+                bail!("unknown scope '{id}' (known: {})", app.scope_ids_label())
+            }
+            _ => ScopeFilter::Only(Some(id)),
+        }
+    } else {
+        ScopeFilter::ActiveIn(
+            app.scopes
+                .active(&app.cwd)
+                .iter()
+                .map(|s| s.id.clone())
+                .collect(),
+        )
+    };
     let filter = Filter {
         category: category.map(|c| crate::store::normalize_category(&c)),
         kind: match kind {
             Some(k) => Some(k.parse().map_err(|e: String| anyhow::anyhow!(e))?),
             None => None,
         },
+        scope,
     };
     let results = app.search("", &filter);
     if results.is_empty() {
@@ -389,7 +433,7 @@ fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
             current = e.category.clone();
             println!("\n{current}");
         }
-        println!("  {}  [{}]  {}", e.name, e.kind, e.command);
+        println!("  {}  [{}]  {}", EntryKey::of(e).label(), e.kind, e.command);
     }
     Ok(())
 }

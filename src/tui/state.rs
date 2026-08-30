@@ -113,6 +113,7 @@ impl UiState {
         let filter = Filter {
             category: self.category_filter.clone(),
             kind: self.kind_filter,
+            ..Filter::default()
         };
         let index: HashMap<EntryKey, usize> = self
             .entries
