@@ -83,52 +83,76 @@ cmd-man
 
 ### Command line
 
+#### Add an alias
 ```sh
-# Add an alias
 cmd-man add gitsw --command "git switch" --desc "switch branches" --category git
+```
 
-# Add a function
+#### Add a function
+```sh
 cmd-man add mkcd --kind function --command 'mkdir -p "$1" && cd "$1"' --desc "make and enter a dir"
+```
 
-# Guided creation
+#### Guided creation
+```sh
 cmd-man new
+```
 
-# Add without auto-filling fields from --help
+#### Add without auto-filling fields from --help
+```sh
 cmd-man add gitsw --command "git switch" --desc "switch branches" --no-help
+```
 
-# Search, list, edit, remove
+#### Search, list, edit, remove
+```sh
 cmd-man search switch
 cmd-man list --kind function
 cmd-man edit gitsw --desc "switch or create branches"
 cmd-man rm gitsw
+```
 
-# Scope an entry to the current project
+#### Scope an entry to the current project
+```sh
 cmd-man add dep --command "make deploy" --desc "deploy" --here
+```
 
-# Move an existing entry into a scope, or back out of one
+#### Move an existing entry into a scope, or back out of one
+```sh
 cmd-man edit dep --move-here
 cmd-man edit dep --make-global
+```
 
-# Work with a specific entry when a name exists more than once
+#### Work with a specific entry when a name exists more than once
+```sh
 cmd-man rm dep --in api
 cmd-man list --all
 cmd-man list --in global
+```
 
-# Manage scopes
+#### Manage scopes
+```sh
 cmd-man scope list
 cmd-man scope relocate api ~/work/api
 cmd-man scope rm api --promote-to-global
+```
 
-# Capture example output for an entry
+#### Capture example output for an entry
+```sh
 cmd-man capture <alias>
+```
 
-# Import aliases and functions already active in your shell
+#### Import aliases and functions already active in your shell
+```sh
 cmd-man import
+```
 
-# Regenerate shell files and reload
+#### Regenerate shell files and reload
+```sh
 cmd-man reload
+```
 
-# Back up and restore
+#### Back up and restore
+```sh
 cmd-man backup
 cmd-man restore
 ```
