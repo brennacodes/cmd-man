@@ -18,6 +18,9 @@ const FUNCTION_COLOR: Color = Color::Magenta;
 const ALIAS_COLOR: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 
+/// The gutter every form label is padded into, so values line up in a column.
+const FORM_LABEL_WIDTH: usize = 28;
+
 fn label_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
@@ -270,6 +273,7 @@ fn draw_form(frame: &mut Frame, form: &Form) {
         .title(format!(" {} ", form.title))
         .border_style(header_style());
 
+    let inner_width = area.width.saturating_sub(2) as usize;
     let mut lines = Vec::new();
     for (i, field) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
@@ -278,20 +282,32 @@ fn draw_form(frame: &mut Frame, form: &Form) {
         } else {
             field.label.to_string()
         };
+        let label = clip(&format!("{label:<FORM_LABEL_WIDTH$}"), inner_width, false);
+        let cursor = if focused && width(&label) < inner_width {
+            "\u{2588}"
+        } else {
+            ""
+        };
+        let budget = inner_width - width(&label) - width(cursor);
+        let value = clip(&field.value, budget, focused);
         if focused {
             // Reversed video reads clearly on both light and dark terminals.
             let focus_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
             lines.push(Line::from(vec![Span::styled(
-                format!("{label:<28}{}\u{2588}", field.value),
+                format!("{label}{value}{cursor}"),
                 focus_style,
             )]));
         } else {
+            let value_style = if field.readonly {
+                label_style()
+            } else {
+                Style::default()
+            };
             lines.push(Line::from(vec![
-                Span::styled(format!("{label:<28}"), label_style()),
-                Span::raw(field.value.clone()),
+                Span::styled(label, label_style()),
+                Span::styled(value, value_style),
             ]));
         }
-        lines.push(Line::from(""));
     }
 
     if let Some(err) = &form.error {
@@ -300,17 +316,68 @@ fn draw_form(frame: &mut Frame, form: &Form) {
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         )));
     }
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Tab/Shift-Tab: fields   Ctrl-F: fetch help   Enter: save   Esc: cancel",
         Style::default().add_modifier(Modifier::DIM),
     )));
 
+    let inner_rows = area.height.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((form_scroll(form.focus, inner_rows), 0)),
         area,
     );
+}
+
+/// The columns `text` occupies, measured the way the renderer measures it.
+fn width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// `text` shortened to `budget` columns, marking the cut with an ellipsis. A
+/// focused field keeps its tail so the cursor stays in view while typing; every
+/// other field keeps its head.
+fn clip(text: &str, budget: usize, keep_tail: bool) -> String {
+    if width(text) <= budget {
+        return text.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let keep = budget - 1;
+    let mut used = 0;
+    if keep_tail {
+        let mut start = text.len();
+        for (i, ch) in text.char_indices().rev() {
+            used += width(&text[i..i + ch.len_utf8()]);
+            if used > keep {
+                break;
+            }
+            start = i;
+        }
+        format!("\u{2026}{}", &text[start..])
+    } else {
+        let mut end = 0;
+        for (i, ch) in text.char_indices() {
+            used += width(&text[i..i + ch.len_utf8()]);
+            if used > keep {
+                break;
+            }
+            end = i + ch.len_utf8();
+        }
+        format!("{}\u{2026}", &text[..end])
+    }
+}
+
+/// The first row of the form to draw, so the focused field stays on screen on a
+/// popup too short for every field. Each field occupies exactly one row because
+/// `draw_form` clips every value to the width of the popup.
+fn form_scroll(focus: usize, inner_rows: usize) -> u16 {
+    let last_visible = inner_rows.saturating_sub(1);
+    u16::try_from(focus.saturating_sub(last_visible)).unwrap_or(u16::MAX)
 }
 
 fn kind_color(kind: Kind) -> Color {
@@ -355,4 +422,160 @@ fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     ])
     .split(vertical[1]);
     horizontal[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Entry;
+    use crate::tui::form::SCOPE;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// The form popup rendered into a terminal of the given size, one string
+    /// per row.
+    fn render_form(form: &Form, width: u16, height: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| draw_form(frame, form)).unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_field_fits_a_standard_eighty_by_twenty_four_terminal() {
+        let rows = render_form(&Form::new_entry(), 80, 24);
+        for field in Form::new_entry().fields.iter() {
+            assert!(
+                rows.iter().any(|row| row.contains(field.label)),
+                "{} is off screen in:\n{}",
+                field.label,
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_value_sits_in_its_own_column() {
+        let mut form = Form::new_entry();
+        form.fields[SCOPE].value = "api".into();
+        let rows = render_form(&form, 80, 24);
+        let scope = rows
+            .iter()
+            .find(|row| row.contains("Scope"))
+            .unwrap_or_else(|| panic!("no scope row in:\n{}", rows.join("\n")));
+        let label = "Scope (global/here/<id>)";
+        assert!(
+            scope.contains(&format!("{label:<FORM_LABEL_WIDTH$}api")),
+            "scope row was: {scope}"
+        );
+    }
+
+    #[test]
+    fn the_focused_field_stays_on_screen_on_a_short_terminal() {
+        let mut form = Form::new_entry();
+        form.focus = SCOPE;
+        let rows = render_form(&form, 80, 12);
+        assert!(
+            rows.iter().any(|row| row.contains("Scope")),
+            "focused field scrolled away in:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn long_values_do_not_push_the_focused_field_off_screen() {
+        let mut form = Form::new_entry();
+        for field in form.fields.iter_mut() {
+            field.value = "-a, --all do not ignore entries starting with .".repeat(6);
+        }
+        form.focus = SCOPE;
+        for height in [12, 24] {
+            let rows = render_form(&form, 80, height);
+            assert!(
+                rows.iter().any(|row| row.contains("Scope")),
+                "focused field scrolled away at height {height} in:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_focused_field_keeps_the_end_of_a_long_value_in_view() {
+        let mut form = Form::new_entry();
+        form.fields[SCOPE].value = format!("{}tail", "x".repeat(60));
+        form.focus = SCOPE;
+        let rows = render_form(&form, 80, 24);
+        let scope = rows
+            .iter()
+            .find(|row| row.contains("Scope"))
+            .unwrap_or_else(|| panic!("no scope row in:\n{}", rows.join("\n")));
+        assert!(
+            scope.contains("\u{2026}") && scope.contains("tail\u{2588}"),
+            "scope row was: {scope}"
+        );
+    }
+
+    #[test]
+    fn a_value_of_double_width_characters_still_fits_one_row() {
+        let mut form = Form::new_entry();
+        for field in form.fields.iter_mut() {
+            field.value = "\u{5217}\u{8868}\u{6587}\u{4EF6}".repeat(20);
+        }
+        form.focus = SCOPE;
+        let rows = render_form(&form, 80, 24);
+        for field in Form::new_entry().fields.iter() {
+            assert_eq!(
+                rows.iter().filter(|row| row.contains(field.label)).count(),
+                1,
+                "{} does not occupy exactly one row in:\n{}",
+                field.label,
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_value_is_clipped_to_one_row_per_field() {
+        let mut form = Form::new_entry();
+        for field in form.fields.iter_mut() {
+            field.value = "ls -lah /usr/local/bin ".repeat(10);
+        }
+        let rows = render_form(&form, 80, 24);
+        for field in Form::new_entry().fields.iter() {
+            let matched = rows.iter().filter(|row| row.contains(field.label)).count();
+            assert_eq!(
+                matched,
+                1,
+                "{} spans {matched} rows in:\n{}",
+                field.label,
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_scope_is_still_rendered() {
+        let mut entry = Entry::new("ll", Kind::Alias, "ls -lah", "d");
+        entry.scope = Some("api".into());
+        let rows = render_form(&Form::edit(&entry), 80, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("Scope (read only)")),
+            "no read only scope row in:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn scrolling_starts_at_the_top_until_the_focus_would_fall_off() {
+        assert_eq!(form_scroll(0, 12), 0);
+        assert_eq!(form_scroll(9, 12), 0);
+        assert_eq!(form_scroll(9, 5), 5);
+        assert_eq!(form_scroll(9, 0), 9);
+    }
 }

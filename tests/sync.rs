@@ -17,14 +17,27 @@ use tempfile::TempDir;
 
 static GIT_IDENTITY: Once = Once::new();
 
-/// Give git a committer identity via env so commits work without global config.
+/// Give git a committer identity and an empty configuration via env, so these
+/// tests neither need nor inherit the developer's global git settings. The
+/// variables are also inherited by the binary and by the detached sync helper.
 fn ensure_git_identity() {
     GIT_IDENTITY.call_once(|| unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
         std::env::set_var("GIT_AUTHOR_NAME", "cmd-man test");
         std::env::set_var("GIT_AUTHOR_EMAIL", "test@example.com");
         std::env::set_var("GIT_COMMITTER_NAME", "cmd-man test");
         std::env::set_var("GIT_COMMITTER_EMAIL", "test@example.com");
     });
+}
+
+/// Run one sync cycle and assert the outcome it recorded, so a machine that
+/// fails to seed the remote fails here rather than as a confusing assertion
+/// about the machine that syncs next.
+fn sync_expecting(paths: &Paths, config: &Config, timestamp: &str, outcome: &str) {
+    backup::run_sync(paths, config, timestamp).unwrap();
+    let status = backup::read_status(paths).unwrap();
+    assert_eq!(status.outcome, outcome, "message: {}", status.message);
 }
 
 fn bare_remote() -> TempDir {
@@ -104,10 +117,12 @@ fn sync_pushes_local_entries_to_remote() {
     let paths = Paths::with_root(home.path().to_path_buf());
     seed_store(&paths, "gitsw", "git switch");
 
-    backup::run_sync(&paths, &config_with_remote(url), "2026-08-16T00:00:00Z").unwrap();
-
-    let status = backup::read_status(&paths).unwrap();
-    assert_eq!(status.outcome, "ok", "message: {}", status.message);
+    sync_expecting(
+        &paths,
+        &config_with_remote(url),
+        "2026-08-16T00:00:00Z",
+        "ok",
+    );
 
     let check = TempDir::new().unwrap();
     clone_url_into(url, check.path());
@@ -128,23 +143,21 @@ fn sync_bootstraps_empty_store_from_remote() {
     let seed = TempDir::new().unwrap();
     let seed_paths = Paths::with_root(seed.path().to_path_buf());
     seed_store(&seed_paths, "seeded", "echo seeded");
-    backup::run_sync(
+    sync_expecting(
         &seed_paths,
         &config_with_remote(url),
         "2026-08-16T00:00:00Z",
-    )
-    .unwrap();
+        "ok",
+    );
 
     // Fresh machine: empty home pointed at the populated remote.
     let home = TempDir::new().unwrap();
     let paths = Paths::with_root(home.path().to_path_buf());
-    backup::run_sync(&paths, &config_with_remote(url), "2026-08-16T00:01:00Z").unwrap();
-
-    let status = backup::read_status(&paths).unwrap();
-    assert_eq!(
-        status.outcome, "bootstrapped",
-        "message: {}",
-        status.message
+    sync_expecting(
+        &paths,
+        &config_with_remote(url),
+        "2026-08-16T00:01:00Z",
+        "bootstrapped",
     );
 
     let loaded = Store::load(&paths).unwrap();
@@ -168,12 +181,12 @@ fn sync_does_not_clobber_local_only_entries() {
     let seed = TempDir::new().unwrap();
     let seed_paths = Paths::with_root(seed.path().to_path_buf());
     seed_store(&seed_paths, "remoteonly", "echo remote");
-    backup::run_sync(
+    sync_expecting(
         &seed_paths,
         &config_with_remote(url),
         "2026-08-16T00:00:00Z",
-    )
-    .unwrap();
+        "ok",
+    );
 
     // Local machine already has its own entry and no git repo yet.
     let home = TempDir::new().unwrap();
@@ -200,17 +213,25 @@ fn sync_merges_disjoint_categories_across_machines() {
     let machine_a = TempDir::new().unwrap();
     let a_paths = Paths::with_root(machine_a.path().to_path_buf());
     seed_store_in(&a_paths, "gitsw", "git switch", "git");
-    backup::run_sync(&a_paths, &config_with_remote(url), "2026-08-16T00:00:00Z").unwrap();
+    sync_expecting(
+        &a_paths,
+        &config_with_remote(url),
+        "2026-08-16T00:00:00Z",
+        "ok",
+    );
 
     // Machine B has a different entry and no repo yet, then syncs.
     let machine_b = TempDir::new().unwrap();
     let b_paths = Paths::with_root(machine_b.path().to_path_buf());
     seed_store_in(&b_paths, "cls", "clear", "shell");
-    backup::run_sync(&b_paths, &config_with_remote(url), "2026-08-16T00:01:00Z").unwrap();
-
     // Disjoint histories reconcile into the union of both machines' entries.
-    let status = backup::read_status(&b_paths).unwrap();
-    assert_eq!(status.outcome, "ok", "message: {}", status.message);
+    sync_expecting(
+        &b_paths,
+        &config_with_remote(url),
+        "2026-08-16T00:01:00Z",
+        "ok",
+    );
+
     let loaded = Store::load(&b_paths).unwrap();
     assert!(
         loaded.find(&EntryKey::global("cls")).is_some(),
@@ -276,19 +297,12 @@ fn scopes_file_round_trips_through_the_remote() {
     let paths_a = Paths::with_root(a.path().to_path_buf());
     seed_store(&paths_a, "ll", "ls -la");
     seed_scope(&paths_a, "api", "$HOME/work/api");
-    backup::run_sync(&paths_a, &config, "2026-08-29T00:00:00Z").unwrap();
+    sync_expecting(&paths_a, &config, "2026-08-29T00:00:00Z", "ok");
 
     let b = TempDir::new().unwrap();
     let paths_b = Paths::with_root(b.path().to_path_buf());
     paths_b.ensure_dirs().unwrap();
-    backup::run_sync(&paths_b, &config, "2026-08-29T00:00:01Z").unwrap();
-
-    let status = backup::read_status(&paths_b).unwrap();
-    assert_eq!(
-        status.outcome, "bootstrapped",
-        "message: {}",
-        status.message
-    );
+    sync_expecting(&paths_b, &config, "2026-08-29T00:00:01Z", "bootstrapped");
 
     let pulled = ScopeRegistry::load(&paths_b).unwrap();
     let scope = pulled
@@ -308,12 +322,12 @@ fn a_pull_regenerates_scope_blocks() {
     let paths_a = Paths::with_root(a.path().to_path_buf());
     seed_scoped_store_in(&paths_a, "ll", "ls -lah", "api");
     seed_scope(&paths_a, "api", "/tmp/cmd-man-scope-api");
-    backup::run_sync(&paths_a, &config, "2026-08-29T00:00:00Z").unwrap();
+    sync_expecting(&paths_a, &config, "2026-08-29T00:00:00Z", "ok");
 
     let b = TempDir::new().unwrap();
     let paths_b = Paths::with_root(b.path().to_path_buf());
     paths_b.ensure_dirs().unwrap();
-    backup::run_sync(&paths_b, &config, "2026-08-29T00:00:01Z").unwrap();
+    sync_expecting(&paths_b, &config, "2026-08-29T00:00:01Z", "bootstrapped");
 
     let zsh = std::fs::read_to_string(paths_b.shell_file(Shell::Zsh)).unwrap();
     assert!(

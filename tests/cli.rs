@@ -426,3 +426,51 @@ fn repo_mode_does_not_scope_to_home() {
         .success()
         .stdout(predicate::str::contains("scoped to").not());
 }
+
+#[test]
+fn new_prompts_for_placement() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, &api)
+        .args(["new"])
+        .write_stdin("dep\nalias\necho deploy\ndeploy it\ngeneral\n\n\nhere\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scoped to api"));
+}
+
+#[test]
+fn a_directory_named_here_never_takes_the_here_keyword() {
+    let home = TempDir::new().unwrap();
+    let here = home.path().join("here");
+    let other = home.path().join("other");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+
+    cmd_in(&home, &here)
+        .args(["add", "ll", "-c", "ls -lah", "--desc", "d", "--here"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Added 'll' scoped to here-2 ($HOME/here)",
+        ));
+
+    // Answering the Scope prompt with `here` still means "this directory".
+    cmd_in(&home, &other)
+        .args(["new"])
+        .write_stdin("dep\nalias\necho deploy\ndeploy it\ngeneral\n\n\nhere\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scoped to other"));
+
+    // The directory scope keeps its own id and stays addressable by it.
+    cmd_in(&home, &other)
+        .args([
+            "add", "gg", "-c", "echo gg", "--desc", "d", "--scope", "here-2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scoped to here-2"));
+}

@@ -1,12 +1,15 @@
 //! The add/edit form model used by the TUI.
 
 use crate::model::{Entry, EntryKey, Kind};
+use crate::scopes::Placement;
 
 /// One editable field.
 pub struct Field {
     pub label: &'static str,
     pub value: String,
     pub required: bool,
+    /// Shown for context but neither focusable nor editable.
+    pub readonly: bool,
 }
 
 /// A multi-field form for creating or editing an entry.
@@ -31,6 +34,8 @@ const TAGS: usize = 5;
 const USAGE: usize = 6;
 const OPTIONS: usize = 7;
 const EXAMPLES: usize = 8;
+/// Appended rather than inserted so the constants above keep their positions.
+pub const SCOPE: usize = 9;
 
 impl Form {
     fn blank_fields() -> Vec<Field> {
@@ -39,46 +44,61 @@ impl Form {
                 label: "Alias (trigger, no spaces)",
                 value: String::new(),
                 required: true,
+                readonly: false,
             },
             Field {
                 label: "Kind (alias/function)",
                 value: "alias".into(),
                 required: true,
+                readonly: false,
             },
             Field {
                 label: "Command / body",
                 value: String::new(),
                 required: true,
+                readonly: false,
             },
             Field {
                 label: "Description",
                 value: String::new(),
                 required: true,
+                readonly: false,
             },
             Field {
                 label: "Category",
                 value: "general".into(),
                 required: false,
+                readonly: false,
             },
             Field {
                 label: "Tags (comma separated)",
                 value: String::new(),
                 required: false,
+                readonly: false,
             },
             Field {
                 label: "Usage",
                 value: String::new(),
                 required: false,
+                readonly: false,
             },
             Field {
                 label: "Options",
                 value: String::new(),
                 required: false,
+                readonly: false,
             },
             Field {
                 label: "Examples",
                 value: String::new(),
                 required: false,
+                readonly: false,
+            },
+            Field {
+                label: "Scope (global/here/<id>)",
+                value: String::new(),
+                required: false,
+                readonly: false,
             },
         ]
     }
@@ -107,6 +127,10 @@ impl Form {
         fields[USAGE].value = entry.usage.clone();
         fields[OPTIONS].value = entry.options.clone();
         fields[EXAMPLES].value = entry.examples.clone();
+        // An edit never moves an entry, so the scope is shown, not offered.
+        fields[SCOPE].value = entry.scope.clone().unwrap_or_else(|| "global".into());
+        fields[SCOPE].label = "Scope (read only)";
+        fields[SCOPE].readonly = true;
         Form {
             title: format!("Edit {}", entry.name),
             original: Some(EntryKey::of(entry)),
@@ -118,25 +142,50 @@ impl Form {
     }
 
     pub fn focus_next(&mut self) {
-        self.focus = (self.focus + 1) % self.fields.len();
+        self.step_focus(true);
     }
 
     pub fn focus_prev(&mut self) {
-        self.focus = if self.focus == 0 {
-            self.fields.len() - 1
-        } else {
-            self.focus - 1
-        };
+        self.step_focus(false);
+    }
+
+    /// Move the focus to the next editable field in either direction, leaving
+    /// it alone when every field is read only.
+    fn step_focus(&mut self, forward: bool) {
+        let len = self.fields.len();
+        for step in 1..=len {
+            let idx = if forward {
+                (self.focus + step) % len
+            } else {
+                (self.focus + len - step) % len
+            };
+            if !self.fields[idx].readonly {
+                self.focus = idx;
+                return;
+            }
+        }
     }
 
     pub fn input(&mut self, c: char) {
+        if self.fields[self.focus].readonly {
+            return;
+        }
         self.error = None;
         self.fields[self.focus].value.push(c);
     }
 
     pub fn backspace(&mut self) {
+        if self.fields[self.focus].readonly {
+            return;
+        }
         self.error = None;
         self.fields[self.focus].value.pop();
+    }
+
+    /// The placement the scope field asks for on an add form. Blank means the
+    /// configured default.
+    pub fn placement(&self) -> Placement {
+        Placement::parse(&self.fields[SCOPE].value)
     }
 
     /// The current value of the command field, used to fetch help.
@@ -251,6 +300,72 @@ mod tests {
         form.fields[COMMAND].value = "ls -la".into();
         form.fields[DESCRIPTION].value = "list".into();
         assert_eq!(form.to_entry().unwrap().scope, None);
+    }
+
+    #[test]
+    fn a_blank_scope_field_means_the_default_placement() {
+        let form = Form::new_entry();
+        assert_eq!(form.placement(), Placement::Default);
+    }
+
+    #[test]
+    fn the_scope_field_parses_ids_and_keywords() {
+        let mut form = Form::new_entry();
+        form.fields[SCOPE].value = "api".into();
+        assert_eq!(form.placement(), Placement::Scope("api".into()));
+        form.fields[SCOPE].value = "global".into();
+        assert_eq!(form.placement(), Placement::Global);
+        form.fields[SCOPE].value = "here".into();
+        assert_eq!(form.placement(), Placement::Here);
+    }
+
+    #[test]
+    fn editing_a_scoped_entry_shows_its_scope() {
+        let mut entry = Entry::new("ll", Kind::Alias, "ls -lah", "d");
+        entry.scope = Some("api".into());
+        let form = Form::edit(&entry);
+        assert_eq!(form.fields[SCOPE].value, "api");
+        assert_eq!(
+            form.original,
+            Some(EntryKey {
+                scope: Some("api".into()),
+                name: "ll".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_edit_form_shows_the_scope_without_offering_to_change_it() {
+        let mut entry = Entry::new("ll", Kind::Alias, "ls -lah", "d");
+        entry.scope = Some("api".into());
+        let mut form = Form::edit(&entry);
+        assert!(form.fields[SCOPE].readonly);
+
+        form.focus = EXAMPLES;
+        form.focus_next();
+        assert_eq!(form.focus, NAME, "focus must skip the read only scope");
+        form.focus_prev();
+        assert_eq!(form.focus, EXAMPLES);
+
+        form.focus = SCOPE;
+        form.input('x');
+        form.backspace();
+        assert_eq!(form.fields[SCOPE].value, "api");
+    }
+
+    #[test]
+    fn the_edit_form_labels_an_unscoped_entry_global() {
+        let entry = Entry::new("ll", Kind::Alias, "ls -lah", "d");
+        let form = Form::edit(&entry);
+        assert_eq!(form.fields[SCOPE].value, "global");
+        assert_eq!(form.to_entry().unwrap().scope, None);
+    }
+
+    #[test]
+    fn appending_scope_does_not_renumber_the_other_fields() {
+        let form = Form::new_entry();
+        assert_eq!(form.fields.len(), SCOPE + 1);
+        const { assert!(SCOPE > EXAMPLES) };
     }
 
     #[test]

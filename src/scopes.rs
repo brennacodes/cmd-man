@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::ScopeDefault;
 use crate::paths::{self, Paths};
 
-/// Ids the shell dispatcher and the CLI reserve for the unscoped set.
-const RESERVED_IDS: [&str; 2] = ["global", "all"];
+/// Ids reserved by the shell dispatcher and by the placement keywords, so an
+/// auto-generated id can never shadow one of them.
+const RESERVED_IDS: [&str; 3] = ["global", "all", "here"];
 
 /// A named directory scope. `path` is stored `$HOME`-relative when possible so
 /// the registry travels between machines.
@@ -405,6 +406,7 @@ mod tests {
             "global-2"
         );
         assert_eq!(reg.plan_create(Path::new("/x/all"), "now").id, "all-2");
+        assert_eq!(reg.plan_create(Path::new("/x/here"), "now").id, "here-2");
     }
 
     #[test]

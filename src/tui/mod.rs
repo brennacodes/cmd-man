@@ -10,7 +10,6 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use crate::app::{App, now_timestamp};
 use crate::backup;
 use crate::model::EntryKey;
-use crate::scopes::Placement;
 
 use form::Form;
 use state::{Action, ConfirmKind, Mode, UiState};
@@ -109,10 +108,12 @@ fn handle_form_key(form: &mut Option<Form>, key: KeyEvent) -> Option<Action> {
                 // Skip the on-save fetch if help was already pulled for this
                 // exact command via Ctrl-F.
                 let autofill = f.helped_command.as_deref() != Some(f.command_value());
+                let placement = f.placement();
                 *form = None;
                 Some(Action::Submit {
                     original,
                     entry: Box::new(entry),
+                    placement,
                     autofill,
                 })
             }
@@ -248,21 +249,25 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
         Action::Submit {
             original,
             entry,
+            placement,
             autofill,
         } => {
             let mut entry = *entry;
             if autofill {
                 app.fill_from_help(&mut entry);
             }
-            let label = EntryKey::of(&entry).label();
             let result = match &original {
-                Some(old) => app.update(old, entry),
-                None => app.add(entry, &Placement::Default).map(|_| ()),
+                Some(old) => {
+                    // Computed before `update` takes the entry.
+                    let updated = EntryKey::of(&entry);
+                    app.update(old, entry).map(|()| updated)
+                }
+                None => app.add(entry, &placement),
             };
             match result {
-                Ok(()) => {
+                Ok(key) => {
                     refresh(app, state);
-                    state.set_status(format!("Saved '{label}'"));
+                    state.set_status(format!("Saved '{}'", key.label()));
                 }
                 Err(e) => state.set_status(format!("Save failed: {e}")),
             }
@@ -343,10 +348,25 @@ mod tests {
     use crate::config::Config;
     use crate::model::{Entry, Kind};
     use crate::paths::Paths;
+    use crate::scopes::{Placement, ScopeRegistry};
     use crate::store::Store;
+    use tempfile::TempDir;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// An app rooted entirely in `dir`, including its home, so scope walks stop
+    /// at the temporary tree. The store and registry are read back from disk so
+    /// two apps built from the same `dir` see each other's writes.
+    fn test_app_with(dir: &TempDir, config: Config) -> App {
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let store = Store::load(&paths).unwrap();
+        let scopes = ScopeRegistry::load(&paths).unwrap();
+        App::with(paths, config, store)
+            .with_scopes(scopes)
+            .with_home(dir.path().canonicalize().unwrap())
     }
 
     #[test]
@@ -409,6 +429,59 @@ mod tests {
         assert!(form.as_ref().unwrap().error.is_some());
     }
 
+    /// A valid add form, typed through the key handler, carrying `scope` in
+    /// its scope field.
+    fn typed_add_form(scope: &str) -> Option<Form> {
+        let mut form = Some(Form::new_entry());
+        let type_in = |form: &mut Option<Form>, text: &str| {
+            for c in text.chars() {
+                handle_form_key(form, key(KeyCode::Char(c)));
+            }
+        };
+        type_in(&mut form, "gitsw"); // focus starts on the name field
+        handle_form_key(&mut form, key(KeyCode::Tab)); // kind, already alias
+        handle_form_key(&mut form, key(KeyCode::Tab)); // command
+        type_in(&mut form, "git switch");
+        handle_form_key(&mut form, key(KeyCode::Tab)); // description
+        type_in(&mut form, "switch branches");
+        form.as_mut().unwrap().fields[form::SCOPE].value = scope.into();
+        form
+    }
+
+    #[test]
+    fn the_scope_field_reaches_the_submit_action() {
+        for (typed, expected) in [
+            ("", Placement::Default),
+            ("here", Placement::Here),
+            ("global", Placement::Global),
+            ("api", Placement::Scope("api".into())),
+        ] {
+            let mut form = typed_add_form(typed);
+            match handle_form_key(&mut form, key(KeyCode::Enter)) {
+                Some(Action::Submit { placement, .. }) => assert_eq!(placement, expected),
+                other => panic!("expected a submit for '{typed}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_form_asking_for_here_creates_the_entry_in_that_scope() {
+        let dir = TempDir::new().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app_with(&dir, Config::default()).with_cwd(api.canonicalize().unwrap());
+        let mut state = UiState::new(vec![]);
+
+        let mut form = typed_add_form("here");
+        let action = handle_form_key(&mut form, key(KeyCode::Enter)).unwrap();
+        execute(action, &mut app, &mut state).unwrap();
+
+        assert_eq!(
+            app.store.find_all_named("gitsw")[0].scope.as_deref(),
+            Some("api")
+        );
+    }
+
     #[test]
     fn submit_action_adds_entry_to_app() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,6 +493,7 @@ mod tests {
             Action::Submit {
                 original: None,
                 entry: Box::new(entry),
+                placement: Placement::Default,
                 autofill: false,
             },
             &mut app,
@@ -447,6 +521,7 @@ mod tests {
             Action::Submit {
                 original,
                 entry: Box::new(rebuilt),
+                placement: Placement::Default,
                 autofill: false,
             },
             &mut app,
@@ -456,5 +531,58 @@ mod tests {
 
         assert_eq!(app.store.entries().len(), 1);
         assert_eq!(app.store.entries()[0].scope, Some("api".to_string()));
+    }
+
+    #[test]
+    fn the_tui_and_the_cli_agree_on_placement_under_repo_mode() {
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        let deep = proj.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        let cwd = deep.canonicalize().unwrap();
+
+        let mut config = Config::default();
+        config.scope.default = "repo".into();
+
+        let mut cli_app = test_app_with(&dir, config.clone()).with_cwd(cwd.clone());
+        let cli_key = cli_app
+            .add(
+                Entry::new("a", Kind::Alias, "echo a", "d"),
+                &Placement::Default,
+            )
+            .unwrap();
+
+        // Built after the CLI app has persisted, so it sees the same registry.
+        let mut tui_app = test_app_with(&dir, config).with_cwd(cwd);
+        let mut state = UiState::new(tui_app.store.entries().to_vec());
+        execute(
+            Action::Submit {
+                original: None,
+                entry: Box::new(Entry::new("b", Kind::Alias, "echo b", "d")),
+                placement: Placement::Default,
+                autofill: false,
+            },
+            &mut tui_app,
+            &mut state,
+        )
+        .unwrap();
+
+        let tui_scope = tui_app.store.find_all_named("b")[0].scope.clone();
+        assert_eq!(cli_key.scope, tui_scope);
+        assert_eq!(cli_key.scope.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn abandoning_the_add_form_registers_no_scope() {
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        let mut config = Config::default();
+        config.scope.default = "repo".into();
+        let app = test_app_with(&dir, config).with_cwd(proj.canonicalize().unwrap());
+
+        let _form = Form::new_entry();
+        assert!(app.scopes.is_empty());
     }
 }

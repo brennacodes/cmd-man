@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::model::{Entry, EntryKey, Kind};
+use crate::scopes::Placement;
 use crate::search::{Filter, search};
 
 /// An operation the run loop must carry out against the App.
@@ -24,6 +25,8 @@ pub enum Action {
     Submit {
         original: Option<EntryKey>,
         entry: Box<Entry>,
+        /// Where an added entry should land. Ignored on an edit.
+        placement: Placement,
         /// Whether to auto-fill empty help fields before saving.
         autofill: bool,
     },

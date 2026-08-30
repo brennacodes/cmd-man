@@ -266,6 +266,7 @@ fn cmd_new() -> Result<()> {
     let category = prompt("Category (general)");
     let tags = prompt("Tags (comma separated)");
     let usage = prompt("Usage (optional)");
+    let placement = Placement::parse(&prompt("Scope [global/here/<id>] (default)"));
 
     let mut entry = Entry::new(&name, kind, command, description);
     if !category.trim().is_empty() {
@@ -277,8 +278,15 @@ fn cmd_new() -> Result<()> {
     println!("Reading help for the command...");
     app.fill_from_help(&mut entry);
 
-    app.add(entry, &Placement::Default)?;
-    println!("Added '{name}'.");
+    let key = app.add(entry, &placement)?;
+    match &key.scope {
+        Some(_) => println!(
+            "Added '{}' scoped to {}.",
+            key.name,
+            app.placement_label(&key)
+        ),
+        None => println!("Added '{}'.", key.name),
+    }
     print_reload_hint(&app);
     Ok(())
 }
