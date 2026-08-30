@@ -14,6 +14,7 @@
 //!   cases run a managed name through `eval`, which resolves it at run time the
 //!   way an interactive shell would.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -118,7 +119,9 @@ impl Fixture {
         if let Some(scope) = self.scopes.scopes().iter().find(|s| s.path == path) {
             return scope.id.clone();
         }
-        let mut scope = self.scopes.plan_create(dir, "2026-08-29T00:00:00Z");
+        let mut scope = self
+            .scopes
+            .plan_create(dir, "2026-08-29T00:00:00Z", &HashSet::new());
         scope.path = path;
         let id = scope.id.clone();
         self.scopes.insert(scope);

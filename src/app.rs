@@ -1,6 +1,7 @@
 //! Service layer shared by the CLI and TUI: loads state and centralizes every
 //! mutation so the store and generated shell files stay in sync.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -327,8 +328,10 @@ impl App {
         Ok(new_key)
     }
 
-    /// The scope a directory with no scope yet would get, refusing a directory
-    /// the generated shell files cannot carry.
+    /// The scope a directory with no scope yet would get. The id avoids every
+    /// id the store still references, not just the registered ones, so a scope
+    /// lost from `scopes.toml` cannot have its orphaned entries adopted by an
+    /// unrelated directory that happens to slug the same way.
     fn plan_scope(&self, dir: &Path) -> Result<Scope> {
         let path = paths::portable_path(dir);
         if !scopes::is_valid_path(&path) {
@@ -338,7 +341,13 @@ impl App {
                 scopes::one_line(&path)
             );
         }
-        Ok(self.scopes.plan_create(dir, &now_timestamp()))
+        let taken: HashSet<&str> = self
+            .store
+            .entries()
+            .iter()
+            .filter_map(|e| e.scope.as_deref())
+            .collect();
+        Ok(self.scopes.plan_create(dir, &now_timestamp(), &taken))
     }
 
     /// Remove an entry and persist.
@@ -707,6 +716,43 @@ mod tests {
         assert_eq!(
             app.scopes.resolved_path("api").unwrap(),
             root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn add_never_claims_an_id_orphaned_entries_still_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work/api");
+        let other = dir.path().join("other/api");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let mut app = test_app(&dir).with_cwd(work.canonicalize().unwrap());
+
+        let key = app
+            .add(
+                Entry::new("secret", Kind::Alias, "echo prod-token", "d"),
+                &Placement::Here,
+            )
+            .unwrap();
+        assert_eq!(key.scope.as_deref(), Some("api"));
+
+        // The registry loses the line, as a hand edit or a merge can do,
+        // leaving the entry pointing at an id nothing defines.
+        app.scopes = ScopeRegistry::default();
+        let mut app = app.with_cwd(other.canonicalize().unwrap());
+
+        let new_key = app
+            .add(
+                Entry::new("ll", Kind::Alias, "ls -la", "d"),
+                &Placement::Here,
+            )
+            .unwrap();
+
+        assert_eq!(new_key.scope.as_deref(), Some("api-2"));
+        assert!(app.scopes.find("api").is_none());
+        assert_eq!(
+            app.scopes.resolved_path("api-2").unwrap(),
+            other.canonicalize().unwrap()
         );
     }
 

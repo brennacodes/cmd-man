@@ -107,12 +107,19 @@ impl ScopeRegistry {
 
     /// Build the scope a directory would get, without registering it. The id
     /// is the slugged basename, suffixed until it is free and not reserved.
-    pub fn plan_create(&self, dir: &Path, now: &str) -> Scope {
+    ///
+    /// `also_taken` holds ids the registry does not know about but that must
+    /// still not be claimed. Passing the ids stored entries reference keeps a
+    /// new scope from taking over an id that entries orphaned by a hand edit
+    /// or a merge still point at, which would re-home them into an unrelated
+    /// directory.
+    pub fn plan_create(&self, dir: &Path, now: &str, also_taken: &HashSet<&str>) -> Scope {
         let base = slug_id(dir);
         let taken: HashSet<&str> = self.scopes.iter().map(|s| s.id.as_str()).collect();
         let mut id = base.clone();
         let mut suffix = 1;
-        while is_reserved_id(&id) || taken.contains(id.as_str()) {
+        while is_reserved_id(&id) || taken.contains(id.as_str()) || also_taken.contains(id.as_str())
+        {
             suffix += 1;
             id = format!("{base}-{suffix}");
         }
@@ -462,9 +469,9 @@ mod tests {
         ScopeRegistry::from_scopes(scopes)
     }
 
-    /// `plan_create` under a fixed timestamp.
+    /// `plan_create` with nothing taken beyond the registry itself.
     fn plan(reg: &ScopeRegistry, dir: &str) -> Scope {
-        reg.plan_create(Path::new(dir), "now")
+        reg.plan_create(Path::new(dir), "now", &HashSet::new())
     }
 
     #[test]
@@ -488,6 +495,22 @@ mod tests {
         assert_eq!(plan(&reg, "/x/global").id, "global-2");
         assert_eq!(plan(&reg, "/x/all").id, "all-2");
         assert_eq!(plan(&reg, "/x/here").id, "here-2");
+    }
+
+    #[test]
+    fn plan_create_avoids_ids_taken_outside_the_registry() {
+        let reg = registry(vec![]);
+        let taken: HashSet<&str> = ["api"].into_iter().collect();
+        assert_eq!(
+            reg.plan_create(Path::new("/other/api"), "now", &taken).id,
+            "api-2"
+        );
+
+        let reg = registry(vec![scope("api-2", "/b/api")]);
+        assert_eq!(
+            reg.plan_create(Path::new("/other/api"), "now", &taken).id,
+            "api-3"
+        );
     }
 
     #[test]
