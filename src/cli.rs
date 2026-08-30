@@ -334,6 +334,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         ),
         None => println!("Added '{}'.", key.name),
     }
+    print_exclusions(&app, &key);
     print_reload_hint(&app);
 
     if args.capture {
@@ -393,8 +394,17 @@ fn cmd_new() -> Result<()> {
         ),
         None => println!("Added '{}'.", key.name),
     }
+    print_exclusions(&app, &key);
     print_reload_hint(&app);
     Ok(())
+}
+
+/// Say so when a stored entry cannot go into every generated file. It is not an
+/// error, so it goes out after the confirmation rather than instead of it.
+fn print_exclusions(app: &App, key: &EntryKey) {
+    for note in app.exclusion_notes(key) {
+        eprintln!("cmd-man: {note}");
+    }
 }
 
 fn cmd_search(query: &str) -> Result<()> {
@@ -507,6 +517,7 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
 
     let new_key = app.update(&key, entry, placement.as_ref())?;
     println!("Updated '{}'.", new_key.label());
+    print_exclusions(&app, &new_key);
     print_reload_hint(&app);
     Ok(())
 }
@@ -692,7 +703,7 @@ fn cmd_import(yes: bool) -> Result<()> {
     }
     println!("Found {} unmanaged definition(s).", candidates.len());
 
-    let mut imported = 0;
+    let mut keys = Vec::new();
     for entry in candidates {
         let accept = yes
             || confirm(&format!(
@@ -700,17 +711,23 @@ fn cmd_import(yes: bool) -> Result<()> {
                 entry.kind, entry.name, entry.command
             ));
         if accept {
+            let key = EntryKey::of(&entry);
             let name = entry.name.clone();
             match app.store.add(entry) {
-                Ok(()) => imported += 1,
+                Ok(()) => keys.push(key),
                 Err(e) => eprintln!("Skipped '{name}': {e}"),
             }
         }
     }
-    if imported > 0 {
+    if !keys.is_empty() {
         app.persist()?;
     }
-    println!("Imported {imported} definition(s).");
+    println!("Imported {} definition(s).", keys.len());
+    // An imported body is the one that arrives already written, so a zsh-only
+    // shape is likelier here than anywhere the user typed the command.
+    for key in &keys {
+        print_exclusions(&app, key);
+    }
     print_reload_hint(&app);
     Ok(())
 }

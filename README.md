@@ -12,6 +12,8 @@ aliases and functions. Entries you add become real shell definitions, so a store
 - Live shell integration for zsh and bash, so aliases and functions behave natively.
 - Aliases and functions are both first-class, tagged by kind so you can parse your
   catalog by type.
+- Function bodies are checked before they are saved. One your shell could not read
+  is refused with the reason, so a broken entry never reaches your shell.
 - Directory scopes: an entry can belong to a project directory, so that project's
   `deploy` is live only inside it and shadows any global entry of the same name.
 - Categories, descriptions, usage, options, examples, and tags on every entry.

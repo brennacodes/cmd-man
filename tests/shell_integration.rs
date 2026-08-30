@@ -241,6 +241,296 @@ fn an_injected_scope_registry_defines_nothing_in_either_shell() {
     }
 }
 
+/// A function body is the one stored value written into the generated file as
+/// code rather than as a quoted string, and category files travel over sync the
+/// same way `scopes.toml` does. A body that closes its own definition would put
+/// its tail at top level, where a scope block runs it on every `cd`.
+#[test]
+fn an_injected_function_body_defines_nothing_in_either_shell() {
+    let mut fx = Fixture::new();
+    let api = fx.dir("work/api");
+    fx.add_scoped(&api, "dep", Kind::Alias, "echo dep");
+    fx.add_global("ll", Kind::Alias, "ls -la");
+    fx.add_global("kruby", Kind::Function, "echo safe");
+    fx.add_scoped(&api, "scoped", Kind::Function, "echo safe-scoped");
+    // Sorted after each bad body, and functions because bash does not expand
+    // aliases in a non-interactive shell.
+    fx.add_global("survivor", Kind::Function, "echo SURVIVED");
+    fx.add_scoped(&api, "survivor_here", Kind::Function, "echo SURVIVED-HERE");
+
+    // The store accepts both bodies, so put the malformed one in the way a bad
+    // merge would: straight into the category file, behind `Entry::validate`.
+    fx.store.save(&fx.paths).unwrap();
+    fx.scopes.save(&fx.paths).unwrap();
+    let file = fx.paths.categories_dir().join("general.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace(
+            "command = \"echo safe\"",
+            "command = \"}\\nalias pwned='echo PWNED'\"",
+        )
+        .replace(
+            "command = \"echo safe-scoped\"",
+            "command = \"}\\nalias owned='echo OWNED'\"",
+        ),
+    )
+    .unwrap();
+    fx.run(&["reload"]);
+
+    for shell in ["zsh", "bash"] {
+        let rendered = std::fs::read_to_string(fx.file(shell)).unwrap();
+        assert!(!rendered.contains("PWNED"), "{shell} file was: {rendered}");
+        assert!(!rendered.contains("OWNED"), "{shell} file was: {rendered}");
+        if !have(shell) {
+            continue;
+        }
+        // The healthy entries still resolve, which means the file parsed all
+        // the way through rather than dying where the bad body was dropped.
+        let out = run_shell(
+            shell,
+            &fx.file(shell),
+            &format!(
+                "type pwned\ntype owned\nsurvivor\ncd '{}'\n_cmdman_apply\nsurvivor_here\n",
+                api.display()
+            ),
+        );
+        assert!(!out.contains("PWNED"), "{shell} out was: {out}");
+        assert!(!out.contains("OWNED"), "{shell} out was: {out}");
+        assert!(out.contains("SURVIVED"), "{shell} out was: {out}");
+        assert!(out.contains("SURVIVED-HERE"), "{shell} out was: {out}");
+    }
+}
+
+/// Bodies the lint accepts, in the shapes most likely to fool a scan that reads
+/// shell text without parsing it.
+const ACCEPTED_BODIES: &[&str] = &[
+    "git status",
+    "echo {",
+    "echo $(date)#tag",
+    "grep -q x <<< \"$1\"",
+    "echo $((1 << 2))",
+    "[ -d .git ] && { git status; git log -1; }",
+    "if [ -d x ]; then cd x; else mkdir x; fi",
+    "for f in *.rs; do echo \"$f\"; done",
+    "case \"$1\" in\n  do) echo d ;;\n  done) echo n ;;\n  *) echo o ;;\nesac",
+    "case $1 in (a|b) echo ab ;; (*) echo o ;; esac",
+    "inner() {\n  echo hi\n}\ninner",
+    "function inner {\n  echo hi\n}",
+    "cat <<EOF\n}\nEOF",
+    "echo \"$(basename \"$1\")\"",
+    "! command -v git > /dev/null",
+    "docker ps --format \"{{.Names}}\"",
+    "awk '{print $1}' \"$1\"",
+    "printf '%s\\n' \"${1:-5}\"",
+    "echo pre{a,b}post",
+    "find . -name '*.tmp' -exec rm {} \\;",
+    "echo a &&\n  echo b",
+    "git log --oneline | head -5",
+    "until [ -f ready ]; do sleep 1; done",
+    "select o in a b; do echo \"$o\"; break; done",
+    "case $1 in a) ;; *) echo o ;; esac",
+    "sleep 0 &\nwait",
+    "time for i in 1; do :; done",
+    "if { true; }; then echo a; fi",
+    "if case $1 in a) true ;; esac; then echo a; fi",
+    "echo ${x//\\}/]}",
+    "x=$(cat <<'EOF'\n}\nEOF\n)\necho \"$x\" > /dev/null",
+    "trap '}' EXIT",
+    "cat <<E}F\nx\nE}F",
+    "echo {a,${x}}",
+    "case $1 in a) case $2 in b) echo b ;; esac ;; esac",
+    "{\n  echo a\n  echo b\n} | cat",
+    "for ((i = 1 << 4; i > 0; i >>= 1)); do echo $i; done",
+    "for ((;;)); do break; done",
+    "for ((i = 0; i < 3; i++)) do echo $i; done",
+    "case $1 in esac",
+    "echo $()",
+    "cat /dev/null 2>&1 | cat",
+    "args=()\nargs+=(x)\necho \"${args[@]}\" > /dev/null",
+    "echo \"`date +%Y`\" > /dev/null",
+    "cat <<\\XEOF\n}\nXEOF",
+    "function inner ( ) {\n  echo hi\n}\ninner > /dev/null",
+];
+
+/// Bodies the lint refuses because a shell really does break on one.
+///
+/// The accepted corpus proves the lint is not too strict; this one proves it is
+/// not strict for nothing. Every entry here has to damage at least one shell,
+/// which is what earns the refusal. The bar is "at least one" rather than
+/// "both" on purpose: `ls -l}` closes the definition in zsh and is an argument
+/// in bash, and refusing it costs a rewrite while accepting it costs a breakout.
+const REFUSED_BODIES: &[&str] = &[
+    "}\necho PWNED",
+    "ls -l}\necho PWNED",
+    "echo ${x}}\necho PWNED",
+    "echo $(date)}\necho PWNED",
+    "{ echo a }",
+    "{ echo a",
+    "echo 'oops",
+    "cat <<EOF\nhi",
+    "echo &&",
+    "then echo hi",
+    "echo a ;;",
+    "do echo hi; done",
+    "for f in *; echo \"$f\"",
+    "case $1 in a) echo a ;;& b) echo b ;; esac",
+    "echo a ;& echo b",
+    "echo a ;| echo b",
+    "echo a && ; echo b",
+    "echo a; ; echo b",
+    "| echo a",
+    "{ }",
+    "( )",
+    "if true; then fi",
+    "if true; then echo a; else fi",
+    "while true; do done",
+    "# just a note",
+    "foo ( ) { echo hi; }\necho PWNED",
+    "echo a\n| grep x",
+    "echo a\n; echo b",
+    "cat <<EOF\nx\nEOF\n| grep y",
+    "echo a && !",
+    "if then echo x; fi",
+    "while do echo a; done",
+    "case $1 in ;; esac",
+];
+
+/// The other half of the function-body lint: a body it accepts has to survive
+/// being rendered. Asserting only that `body_problem` returns `None` cannot see
+/// a `{` the scan counted as opening a group that the shell reads as a word,
+/// because that mistake shows up as a later `}` closing the definition early.
+/// Sourcing the real generated file does see it: the definition after the probe
+/// goes missing, and the body's tail runs at source time.
+#[test]
+fn an_accepted_function_body_neither_escapes_nor_swallows_its_definition() {
+    let shells: Vec<&str> = ["zsh", "bash"].into_iter().filter(|s| have(s)).collect();
+    if shells.is_empty() {
+        return;
+    }
+    for body in ACCEPTED_BODIES {
+        assert_eq!(
+            cmd_man::lint::body_problem(body),
+            None,
+            "body was: {body:?}"
+        );
+        let mut fx = Fixture::new();
+        fx.add_global("probe", Kind::Function, body);
+        // A function rather than an alias, because bash does not expand aliases
+        // in a non-interactive shell and would report the same text either way.
+        fx.add_global("sentinel", Kind::Function, "echo SENTINEL");
+        fx.generate();
+
+        for shell in &shells {
+            // DEFINED says the body's own definition survived, SENTINEL that the
+            // file parsed past it. A body that escapes loses the first, one that
+            // swallows loses the second.
+            let out = run_shell(
+                shell,
+                &fx.file(shell),
+                "echo QUIET\nsentinel\ntype probe > /dev/null 2>&1 && echo DEFINED\n",
+            );
+            assert_eq!(
+                out, "QUIET\nSENTINEL\nDEFINED\n",
+                "{shell} sourced {body:?} and said: {out}"
+            );
+        }
+    }
+}
+
+/// A body only zsh reads is written into `cmd-man.zsh` and left out of
+/// `cmd-man.bash`, and the bash file is whole without it.
+///
+/// Rendering it into both would be the worst of the two failures this lint
+/// exists for: bash abandons the file at the syntax error, so every later
+/// definition and the scope dispatcher would go with it.
+#[test]
+fn a_zsh_only_case_fall_through_reaches_zsh_and_leaves_bash_intact() {
+    let mut fx = Fixture::new();
+    fx.add_global(
+        "probe",
+        Kind::Function,
+        "case $1 in a) echo A ;& b) echo B ;; esac",
+    );
+    fx.add_global("sentinel", Kind::Function, "echo SENTINEL");
+    fx.generate();
+
+    if have("zsh") {
+        let out = run_shell("zsh", &fx.file("zsh"), "probe a\nsentinel\n");
+        assert_eq!(out, "A\nB\nSENTINEL\n", "zsh said: {out}");
+    }
+    if have("bash") {
+        let out = run_shell(
+            "bash",
+            &fx.file("bash"),
+            "sentinel\ntype probe > /dev/null 2>&1 || echo NO-PROBE\n",
+        );
+        assert_eq!(out, "SENTINEL\nNO-PROBE\n", "bash said: {out}");
+    }
+}
+
+/// The other zsh-only spelling, and the one a plain `cmd-man add` reaches
+/// without any quoting mistake: `|&` is zsh's `2>&1 |`, and bash 3 breaks on it.
+#[test]
+fn a_zsh_only_pipe_reaches_zsh_and_leaves_bash_intact() {
+    let mut fx = Fixture::new();
+    fx.add_global("probe", Kind::Function, "echo A |& cat");
+    fx.add_global("sentinel", Kind::Function, "echo SENTINEL");
+    fx.generate();
+
+    if have("zsh") {
+        let out = run_shell("zsh", &fx.file("zsh"), "probe\nsentinel\n");
+        assert_eq!(out, "A\nSENTINEL\n", "zsh said: {out}");
+    }
+    if have("bash") {
+        let out = run_shell(
+            "bash",
+            &fx.file("bash"),
+            "sentinel\ntype probe > /dev/null 2>&1 || echo NO-PROBE\n",
+        );
+        assert_eq!(out, "SENTINEL\nNO-PROBE\n", "bash said: {out}");
+    }
+}
+
+/// The refusals earn their keep: each body the lint turns away really does break
+/// a shell that is handed it.
+///
+/// This is the only test that can see an over-strict rule, because a refusal is
+/// otherwise checked against nothing but the lint's own message. The definition
+/// is written by hand rather than by the renderer, which would drop the entry.
+#[test]
+fn a_refused_function_body_damages_a_real_shell() {
+    let shells: Vec<&str> = ["zsh", "bash"].into_iter().filter(|s| have(s)).collect();
+    if shells.is_empty() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    for (n, body) in REFUSED_BODIES.iter().enumerate() {
+        assert!(
+            cmd_man::lint::body_problem(body).is_some(),
+            "body was: {body:?}"
+        );
+        let file = dir.path().join(format!("probe{n}.sh"));
+        std::fs::write(
+            &file,
+            format!("function probe {{\n{body}\n}}\nfunction sentinel {{\n  echo SENTINEL\n}}\n"),
+        )
+        .unwrap();
+
+        let damaged: Vec<&str> = shells
+            .iter()
+            .copied()
+            .filter(|shell| {
+                run_shell(shell, &file, "echo QUIET\nsentinel\n") != "QUIET\nSENTINEL\n"
+            })
+            .collect();
+        assert!(
+            !damaged.is_empty(),
+            "{body:?} was refused but {shells:?} all sourced it cleanly"
+        );
+    }
+}
+
 #[test]
 fn zsh_scoped_alias_activates_and_deactivates_on_cd() {
     if !have("zsh") {

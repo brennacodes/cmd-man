@@ -121,14 +121,21 @@ impl App {
                  re-create that scope or move them out of it"
             ));
         }
+        // Judged against the shells actually being generated: a body only zsh
+        // reads is carried nowhere once the zsh file is turned off, and that is
+        // a silent drop rather than a per-shell exclusion.
+        let shells = self.enabled_shells();
         let mut unusable: Vec<String> = self
             .store
             .entries()
             .iter()
             .filter_map(|e| {
-                model::name_problem(&e.name).map(|problem| {
-                    format!("alias '{}' is not defined: {problem}", one_line(&e.name))
-                })
+                let problem =
+                    model::name_problem(&e.name).or_else(|| e.command_problem_among(&shells))?;
+                Some(format!(
+                    "alias '{}' is not defined: {problem}",
+                    one_line(&e.name)
+                ))
             })
             .collect();
         unusable.sort();
@@ -193,6 +200,39 @@ impl App {
             self.config.shells.zsh,
             self.config.shells.bash,
         )
+    }
+
+    /// One line per enabled shell whose generated file has to leave `entry`
+    /// out, saying which shell and why.
+    ///
+    /// Empty for the ordinary entry. `Entry::validate` only refuses a body no
+    /// shell can carry, so a body one of them reads is stored and simply misses
+    /// the other's file. That is worth saying once, at the save that caused it.
+    pub fn exclusion_notes(&self, key: &EntryKey) -> Vec<String> {
+        let Some(entry) = self.store.find(key) else {
+            return Vec::new();
+        };
+        self.enabled_shells()
+            .into_iter()
+            .filter_map(|s| {
+                let problem = entry.command_problem_in(s)?;
+                Some(format!(
+                    "'{}' is left out of the {} file: {problem}.",
+                    one_line(&entry.name),
+                    s.as_str()
+                ))
+            })
+            .collect()
+    }
+
+    fn enabled_shells(&self) -> Vec<shell::Shell> {
+        shell::Shell::all()
+            .into_iter()
+            .filter(|s| match s {
+                shell::Shell::Zsh => self.config.shells.zsh,
+                shell::Shell::Bash => self.config.shells.bash,
+            })
+            .collect()
     }
 
     /// Resolve a placement against the configured default, the registry, and
@@ -1409,6 +1449,136 @@ mod tests {
         assert!(summary.exists);
         assert!(summary.active);
         assert!(summary.inactive_until_resolved.is_none());
+    }
+
+    #[test]
+    fn a_function_body_the_shell_files_cannot_carry_is_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.categories_dir().join("general.toml"),
+            "[[entry]]\nname = \"kruby\"\nkind = \"function\"\n\
+             command = \"}\\necho pwned\"\ndescription = \"d\"\ncategory = \"general\"\n\
+             created_at = \"t\"\nupdated_at = \"t\"\n",
+        )
+        .unwrap();
+
+        let store = Store::load(&paths).unwrap();
+        let app = App::with(paths, Config::default(), store).finish_load();
+
+        assert!(
+            app.notices()
+                .iter()
+                .any(|n| n.contains("kruby") && n.contains("closes the function early")),
+            "notices were: {:?}",
+            app.notices()
+        );
+    }
+
+    #[test]
+    fn a_body_only_one_shell_reads_is_stored_and_reported_once() {
+        // zsh reads the `;&` fall-through and bash does not, so the entry is
+        // saved, kept out of the bash file, and said so at the save rather than
+        // on every load the way a wholly unusable body is.
+        let (dir, mut app) = temp_app();
+        let body = "case $1 in a) echo a ;& b) echo b ;; esac";
+        let key = app
+            .add(
+                Entry::new("ft", Kind::Function, body, "d"),
+                &Placement::Global,
+            )
+            .unwrap();
+
+        let notes = app.exclusion_notes(&key);
+        assert_eq!(notes.len(), 1, "notes were: {notes:?}");
+        assert!(
+            notes[0].contains("'ft' is left out of the bash file"),
+            "note was: {}",
+            notes[0]
+        );
+        assert!(
+            app.notices().is_empty(),
+            "notices were: {:?}",
+            app.notices()
+        );
+        let bash = std::fs::read_to_string(dir.path().join("shell/cmd-man.bash")).unwrap();
+        let zsh = std::fs::read_to_string(dir.path().join("shell/cmd-man.zsh")).unwrap();
+        assert!(!bash.contains("function ft {"), "bash was: {bash}");
+        assert!(zsh.contains("function ft {"), "zsh was: {zsh}");
+    }
+
+    #[test]
+    fn a_turned_off_shell_is_not_spoken_for() {
+        // With no bash file being generated there is nothing for a zsh-only
+        // body to be left out of, so the save says nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.shells.bash = false;
+        let mut app = test_app_with(&dir, config);
+        let key = app
+            .add(
+                Entry::new("ft", Kind::Function, "echo a |& cat", "d"),
+                &Placement::Global,
+            )
+            .unwrap();
+
+        assert!(
+            app.exclusion_notes(&key).is_empty(),
+            "notes were: {:?}",
+            app.exclusion_notes(&key)
+        );
+        assert!(!dir.path().join("shell/cmd-man.bash").exists());
+        let zsh = std::fs::read_to_string(dir.path().join("shell/cmd-man.zsh")).unwrap();
+        assert!(zsh.contains("function ft {"), "zsh was: {zsh}");
+    }
+
+    #[test]
+    fn a_body_no_enabled_shell_reads_is_a_notice() {
+        // The same body with zsh turned off instead is carried nowhere, which
+        // is a silent drop rather than a per-shell exclusion.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.categories_dir().join("general.toml"),
+            "[[entry]]\nname = \"ft\"\nkind = \"function\"\n\
+             command = \"echo a |& cat\"\ndescription = \"d\"\ncategory = \"general\"\n\
+             created_at = \"t\"\nupdated_at = \"t\"\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.shells.zsh = false;
+        let store = Store::load(&paths).unwrap();
+        let app = App::with(paths.clone(), config, store).finish_load();
+        assert!(
+            app.notices()
+                .iter()
+                .any(|n| n.contains("ft") && n.contains("'|&' pipe")),
+            "notices were: {:?}",
+            app.notices()
+        );
+
+        // With zsh on again the same entry has a file that carries it.
+        let store = Store::load(&paths).unwrap();
+        let app = App::with(paths, Config::default(), store).finish_load();
+        assert!(
+            app.notices().is_empty(),
+            "notices were: {:?}",
+            app.notices()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_entry_has_nothing_to_report() {
+        let (_dir, mut app) = temp_app();
+        let key = app
+            .add(
+                Entry::new("ok", Kind::Function, "echo ok", "d"),
+                &Placement::Global,
+            )
+            .unwrap();
+        assert!(app.exclusion_notes(&key).is_empty());
     }
 
     #[test]

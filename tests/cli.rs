@@ -334,6 +334,128 @@ fn an_entry_whose_name_carries_shell_syntax_warns_and_is_not_rendered() {
     }
 }
 
+/// A function body is written verbatim between the braces of its definition,
+/// so one that closes the definition early would leave its tail as top-level
+/// code in a file every new shell sources.
+#[test]
+fn a_function_body_that_escapes_its_definition_is_refused() {
+    let home = TempDir::new().unwrap();
+
+    cmd(&home)
+        .args([
+            "add",
+            "kruby",
+            "--kind",
+            "function",
+            "-c",
+            "}\nalias pwned='echo PWNED'",
+            "--desc",
+            "d",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("closes the function early"));
+
+    assert!(app_entries(&home).is_empty(), "the entry was stored anyway");
+
+    cmd(&home).args(["reload"]).assert().success();
+    for shell in ["cmd-man.zsh", "cmd-man.bash"] {
+        let text = std::fs::read_to_string(store_dir(&home).join("shell").join(shell)).unwrap();
+        assert!(
+            !text.contains("PWNED"),
+            "{shell} carried the payload: {text}"
+        );
+    }
+}
+
+/// The lint refuses a body it cannot prove is self-contained, whichever way it
+/// would break the generated file.
+#[test]
+fn an_unbalanced_function_body_is_refused() {
+    let home = TempDir::new().unwrap();
+    for bad in ["if true; then echo hi", "cat <<EOF\nhi", "echo 'oops"] {
+        cmd(&home)
+            .args(["add", "f", "--kind", "function", "-c", bad, "--desc", "d"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("never closed"));
+    }
+    assert!(app_entries(&home).is_empty(), "an entry was stored anyway");
+
+    // The same shapes are fine once they are finished.
+    for good in [
+        "if true; then echo hi; fi",
+        "cat <<EOF\nhi\nEOF",
+        "echo 'fine'",
+    ] {
+        cmd(&home)
+            .args(["add", "f", "--kind", "function", "-c", good, "--desc", "d"])
+            .assert()
+            .success();
+        cmd(&home).args(["rm", "f"]).assert().success();
+    }
+}
+
+/// A balanced body that the shell still cannot parse is worse than a refusal:
+/// bash abandons the whole generated file, so every later definition and the
+/// scope dispatcher disappear on every shell start, with no notice anywhere.
+#[test]
+fn a_function_body_the_shell_cannot_parse_is_refused() {
+    let home = TempDir::new().unwrap();
+    for (bad, expected) in [
+        ("echo &&", "a '&&' has no command after it"),
+        ("then echo hi", "'then' has no matching 'if'"),
+        ("echo a ;;", "a ';;' has no 'case' branch to end"),
+        ("do echo hi; done", "a 'do' has no loop before it to open"),
+        // The value ends mid-escape, so the backslash would swallow the newline
+        // before the generated closing brace. The only shape here that a plain
+        // command line reaches without a quoting mistake.
+        ("echo hi \\", "the body ends with a backslash"),
+        (
+            "case $1 in a) echo a ;;& b) echo b ;; esac",
+            "a ';;&' case fall-through",
+        ),
+        ("{ }", "a '{' group has no command in it"),
+        ("echo a && ; echo b", "a ';' has no command before it"),
+    ] {
+        cmd(&home)
+            .args(["add", "f", "--kind", "function", "-c", bad, "--desc", "d"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("alias 'f':").and(predicate::str::contains(expected)));
+    }
+    assert!(app_entries(&home).is_empty(), "an entry was stored anyway");
+}
+
+/// A body only one shell reads is not malformed, it is unportable: it is saved
+/// and kept out of the file that would choke on it, and cmd-man says which.
+#[test]
+fn a_function_body_only_one_shell_reads_is_saved_for_that_shell() {
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args([
+            "add",
+            "ft",
+            "--kind",
+            "function",
+            "-c",
+            "case $1 in a) echo a ;& b) echo b ;; esac",
+            "--desc",
+            "d",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "'ft' is left out of the bash file",
+        ));
+
+    assert_eq!(app_entries(&home).len(), 1, "the entry was not stored");
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    let bash = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.bash")).unwrap();
+    assert!(zsh.contains("function ft {"), "zsh was: {zsh}");
+    assert!(!bash.contains("function ft {"), "bash was: {bash}");
+}
+
 #[test]
 fn add_here_scopes_the_entry_and_reports_it() {
     let home = TempDir::new().unwrap();
@@ -1028,4 +1150,32 @@ fn import_does_not_duplicate_a_scoped_name_as_a_global() {
     // The generated file autoloads `add-zsh-hook` to register the dispatcher,
     // so the scanned shell reports it as a defined function.
     assert!(all.iter().all(|e| e.name != "add-zsh-hook"));
+}
+
+/// An imported body is the one that arrives already written, so it is the
+/// likeliest source of a shape only the shell it came from can read.
+#[test]
+fn import_reports_a_body_only_one_shell_reads() {
+    if !have_zsh() {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    cmd(&home).args(["init"]).assert().success();
+    let rc = home.path().join(".zshrc");
+    let mut text = std::fs::read_to_string(&rc).unwrap();
+    text.push_str("fallthru() { case $1 in a) echo a ;& b) echo b ;; esac }\n");
+    std::fs::write(&rc, text).unwrap();
+
+    cmd(&home)
+        .env("ZDOTDIR", home.path())
+        .args(["import", "--yes"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("'fallthru' is left out of the bash file")
+                .and(predicate::str::contains("';&'")),
+        );
+
+    let all = app_entries(&home);
+    assert_eq!(all.iter().filter(|e| e.name == "fallthru").count(), 1);
 }

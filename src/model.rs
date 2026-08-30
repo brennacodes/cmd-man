@@ -1,5 +1,7 @@
 //! Core data types for stored aliases and functions.
 
+use crate::lint;
+use crate::shell::Shell;
 use serde::{Deserialize, Serialize};
 
 /// Whether a stored entry is a simple alias or a shell function.
@@ -130,10 +132,44 @@ impl Entry {
         is_usable_name(&self.name)
     }
 
-    /// Validate required fields and the shape of the trigger alias.
+    /// Why the command cannot be written into any generated shell file, or
+    /// `None` when at least one can carry it.
     ///
-    /// The alias must be a usable shell trigger, on exactly the terms the
-    /// renderer enforces, so nothing `validate` accepts is later dropped.
+    /// Only a function is linted. Its body is emitted verbatim between
+    /// `function NAME {` and `}`, so a malformed one escapes the definition or
+    /// swallows the rest of the file; an alias expansion is single-quoted on the
+    /// way out and cannot break anything whatever it holds.
+    pub fn command_problem(&self) -> Option<String> {
+        self.command_problem_among(&Shell::all())
+    }
+
+    /// Why none of `shells` can carry the command, or `None` when one of them
+    /// can. Which files are generated is a config choice, so an entry only zsh
+    /// reads is defined nowhere once the zsh file is turned off.
+    pub fn command_problem_among(&self, shells: &[Shell]) -> Option<String> {
+        let mut problem = None;
+        for &shell in shells {
+            let found = self.command_problem_in(shell)?;
+            problem.get_or_insert(found);
+        }
+        problem
+    }
+
+    /// Why `shell`'s generated file cannot carry the command, or `None` when it
+    /// can. A body the other shell reads is still stored, so this is the check
+    /// the renderer makes rather than [`Entry::command_problem`].
+    pub fn command_problem_in(&self, shell: Shell) -> Option<String> {
+        match self.kind {
+            Kind::Function => lint::body_problem_in(&self.command, shell),
+            Kind::Alias => None,
+        }
+    }
+
+    /// Validate required fields, the shape of the trigger alias, and the shape
+    /// of a function body.
+    ///
+    /// Both must be usable on exactly the terms the renderer enforces, so
+    /// nothing `validate` accepts is later dropped.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(problem) = name_problem(&self.name) {
             return Err(format!("alias '{}': {problem}", self.name));
@@ -143,6 +179,9 @@ impl Entry {
         }
         if self.description.trim().is_empty() {
             return Err(format!("alias '{}' must have a description", self.name));
+        }
+        if let Some(problem) = self.command_problem() {
+            return Err(format!("alias '{}': {problem}", self.name));
         }
         Ok(())
     }
@@ -367,6 +406,66 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_function_body_that_escapes_its_definition_is_refused_and_unusable() {
+        // The body is written verbatim between the braces of the definition, so
+        // a standalone '}' would end the function and leave the rest as
+        // top-level code, run on source and on every cd.
+        for bad in ["}\necho pwned", "echo hi\n}\nid", "{ echo hi", "echo 'oops"] {
+            let e = Entry::new("kruby", Kind::Function, bad, "desc");
+            assert!(e.validate().is_err(), "expected {bad:?} to be rejected");
+            assert!(
+                e.command_problem().is_some(),
+                "expected {bad:?} to be unusable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_only_one_shell_reads_is_a_problem_for_that_shell_alone() {
+        // The gate is "no generated file can carry it", so a body one shell
+        // reads is stored; turning that shell's file off leaves it carried
+        // nowhere, which is what `command_problem_among` is asked.
+        let e = Entry::new("ft", Kind::Function, "echo a |& cat", "desc");
+        assert!(e.validate().is_ok());
+        assert_eq!(e.command_problem(), None);
+        assert_eq!(e.command_problem_in(Shell::Zsh), None);
+        assert!(e.command_problem_in(Shell::Bash).is_some());
+        assert!(e.command_problem_among(&[Shell::Bash]).is_some());
+        assert_eq!(e.command_problem_among(&[Shell::Zsh]), None);
+        // With no file generated at all there is nothing to be left out of.
+        assert_eq!(e.command_problem_among(&[]), None);
+    }
+
+    #[test]
+    fn an_ordinary_function_body_still_validates() {
+        // The lint sits in front of every save, so a body a user would plausibly
+        // type has to survive it.
+        for good in [
+            "git status",
+            "[ -d .git ] && { git log -1; }",
+            "case $1 in a) echo a ;; esac",
+            "cat <<EOF\n}\nEOF",
+            "grep -q x <<< \"$1\"",
+            "echo {",
+        ] {
+            let e = Entry::new("f", Kind::Function, good, "desc");
+            assert!(e.validate().is_ok(), "expected {good:?} to validate");
+        }
+    }
+
+    #[test]
+    fn only_a_function_body_is_linted() {
+        // An alias expansion is single-quoted on the way into the generated
+        // file, so it cannot break out however it is shaped.
+        let e = Entry::new("ll", Kind::Alias, "}\necho hi", "desc");
+        assert!(e.validate().is_ok());
+        assert_eq!(e.command_problem(), None);
+        for shell in Shell::all() {
+            assert_eq!(e.command_problem_in(shell), None);
+        }
     }
 
     #[test]

@@ -266,7 +266,13 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
             match result {
                 Ok(key) => {
                     refresh(app, state);
-                    state.set_status(format!("Saved '{}'", key.label()));
+                    // A body only one shell can carry is saved, so the status
+                    // line is the one place the user hears about the other.
+                    let status = match app.exclusion_notes(&key).first() {
+                        Some(note) => format!("Saved '{}'; {note}", key.label()),
+                        None => format!("Saved '{}'", key.label()),
+                    };
+                    state.set_status(status);
                 }
                 Err(e) => state.set_status(format!("Save failed: {e}")),
             }
@@ -612,6 +618,34 @@ mod tests {
         assert_eq!(app.store.entries().len(), 1);
         assert_eq!(app.store.entries()[0].scope.as_deref(), Some("api"));
         assert_eq!(state.status, "Saved 'll (api)'");
+    }
+
+    #[test]
+    fn saving_a_body_only_one_shell_reads_says_so_in_the_status_line() {
+        let dir = TempDir::new().unwrap();
+        let mut app = test_app_with(&dir, Config::default());
+        let mut state = state_over(vec![]);
+        let entry = Entry::new("ft", Kind::Function, "echo a |& cat", "d");
+
+        execute(
+            Action::Submit {
+                original: None,
+                entry: Box::new(entry),
+                placement: Placement::Global,
+                autofill: false,
+            },
+            &mut app,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.store.entries().len(), 1);
+        assert!(
+            state.status.starts_with("Saved 'ft'; ")
+                && state.status.contains("left out of the bash file"),
+            "status was: {}",
+            state.status
+        );
     }
 
     #[test]

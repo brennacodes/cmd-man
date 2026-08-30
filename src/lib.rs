@@ -5,6 +5,7 @@ pub mod backup;
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod lint;
 pub mod model;
 pub mod paths;
 pub mod proc;

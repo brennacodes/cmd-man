@@ -57,11 +57,21 @@ const BLOCK_END: &str = "# <<< cmd-man <<<";
 
 /// Render the generated definitions file for a shell.
 ///
-/// Entries whose name is not a plain shell word are dropped rather than
-/// written out: they arrive off disk without having passed `Entry::validate`,
-/// and the name is interpolated unquoted into `alias`, `unalias` and `unset`.
+/// Entries whose name is not a plain shell word, and functions whose body is
+/// not a self-contained shell fragment, are dropped rather than written out:
+/// they arrive off disk without having passed `Entry::validate`, the name is
+/// interpolated unquoted into `alias`, `unalias` and `unset`, and the body is
+/// emitted verbatim between the braces of the definition.
+///
+/// The body check is per shell, because the two do not read the same language.
+/// A body only zsh can carry is stored and written into `cmd-man.zsh` alone; put
+/// into `cmd-man.bash` it would be a syntax error, and bash abandons the whole
+/// file at one of those.
 pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String {
-    let entries: Vec<&Entry> = entries.iter().filter(|e| e.has_usable_name()).collect();
+    let entries: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.has_usable_name() && e.command_problem_in(shell).is_none())
+        .collect();
 
     let mut globals: Vec<&Entry> = entries
         .iter()
@@ -362,7 +372,9 @@ fn render_clearing(name: &str, indent: &str) -> String {
 /// `indent` shifts the wrapper only. A function body is emitted verbatim at
 /// column zero because shell bodies are whitespace sensitive: an indented
 /// heredoc terminator never closes its heredoc, which would swallow the rest of
-/// the generated file.
+/// the generated file. Being verbatim, the body is also the one value here that
+/// is not quoted on the way out, so `render` only reaches this with a body
+/// `lint::body_problem` has cleared.
 fn render_entry(entry: &Entry, indent: &str) -> String {
     let name = &entry.name;
     let mut out = render_clearing(name, indent);
@@ -906,6 +918,64 @@ mod tests {
             assert!(!out.contains(bad), "'{bad}' reached the file: {out}");
             assert!(out.contains("alias ll="), "the good entry was dropped too");
         }
+    }
+
+    #[test]
+    fn a_function_body_that_would_escape_its_definition_is_never_rendered() {
+        // Same route as a bad name: a hand edit or a sync merge puts a body in
+        // front of the renderer without `Entry::validate` having seen it. Here
+        // the payload would land at top level, so it would run on every source.
+        for bad in ["}\necho PWNED", "echo hi\n}\nPWNED", "{ echo PWNED"] {
+            let entries = vec![
+                function_entry("kruby", bad),
+                alias_entry("ll", "ls -lah"),
+                function_entry("hi", "echo hi"),
+            ];
+            let out = render(Shell::Zsh, &entries, &ScopeRegistry::default());
+            assert!(!out.contains("PWNED"), "{bad:?} reached the file: {out}");
+            assert!(!out.contains("kruby"), "the name was still cleared: {out}");
+            assert!(out.contains("alias ll="), "a good entry was dropped too");
+            assert!(
+                out.contains("function hi {"),
+                "a good entry was dropped too"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scoped_function_body_that_would_escape_is_dropped_from_its_block() {
+        // Inside a scope block the escape is worse: the tail would be run by
+        // the dispatcher on every cd, not only when the file is sourced.
+        let scopes = reg(&[("api", "/w/api")]);
+        let mut bad = function_entry("kruby", "}\necho PWNED");
+        bad.scope = Some("api".into());
+        let mut good = function_entry("ok", "echo ok");
+        good.scope = Some("api".into());
+        let out = render(Shell::Zsh, &[bad, good], &scopes);
+        assert!(
+            !out.contains("PWNED"),
+            "the payload reached the file: {out}"
+        );
+        let on = section(&out, "function _cmdman_on_1 {");
+        assert!(on.contains("function ok {"), "on was: {on}");
+    }
+
+    #[test]
+    fn a_body_only_one_shell_reads_reaches_only_that_shells_file() {
+        // zsh's `;&` fall-through is a syntax error in bash, and bash abandons
+        // the whole file at one, so the entry is written for zsh alone.
+        let entries = vec![
+            function_entry("ft", "case $1 in a) echo a ;& b) echo b ;; esac"),
+            function_entry("ok", "echo ok"),
+        ];
+        let scopes = ScopeRegistry::default();
+        let zsh = render(Shell::Zsh, &entries, &scopes);
+        let bash = render(Shell::Bash, &entries, &scopes);
+        assert!(zsh.contains("function ft {"), "zsh was: {zsh}");
+        assert!(!bash.contains("function ft {"), "bash was: {bash}");
+        // The entry beside it is untouched in both.
+        assert!(zsh.contains("function ok {"));
+        assert!(bash.contains("function ok {"));
     }
 
     #[test]
