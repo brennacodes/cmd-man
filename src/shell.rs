@@ -224,12 +224,12 @@ fn render_dispatcher(count: usize) -> String {
     // scope's definitions on top when one `cd` crosses several boundaries.
     for n in (1..=count).rev() {
         out.push_str(&format!(
-            "  if [ \"$_n{n}\" = 0 ] && [ \"${{_cmdman_was_{n}-0}}\" = 1 ]; then _cmdman_off_{n}; fi\n"
+            "  if [ \"$_n{n}\" = 0 ] && [ \"${{_cmdman_was_{n}-0}}\" = 1 ]; then \\_cmdman_off_{n}; fi\n"
         ));
     }
     for n in 1..=count {
         out.push_str(&format!(
-            "  if [ \"$_n{n}\" = 1 ] && [ \"${{_cmdman_was_{n}-0}}\" = 0 ]; then _cmdman_on_{n}; fi\n"
+            "  if [ \"$_n{n}\" = 1 ] && [ \"${{_cmdman_was_{n}-0}}\" = 0 ]; then \\_cmdman_on_{n}; fi\n"
         ));
     }
     out.push('\n');
@@ -294,7 +294,7 @@ fn render_state_reset(count: usize) -> String {
     for n in 1..=count {
         out.push_str(&format!("_cmdman_was_{n}=0\n"));
     }
-    out.push_str("_cmdman_apply\n");
+    out.push_str("\\_cmdman_apply\n");
     out
 }
 
@@ -322,6 +322,8 @@ fn managed_names(entries: &[&Entry], scopes: &ScopeRegistry) -> Vec<String> {
 ///
 /// The clearing is carried by `_cmdman_forget`, which the file first calls in
 /// whatever form this shell sourced last and then redefines and calls again.
+/// Each call is backslash-quoted so that a user's own alias of that name cannot
+/// be expanded in its place, silently skipping the cleanup.
 /// Calling the previous generation's copy is the only way a deleted name can go
 /// away: the regenerated file no longer mentions it, so nothing else here would
 /// name it. Carrying the set as a function body rather than as a string that
@@ -329,7 +331,7 @@ fn managed_names(entries: &[&Entry], scopes: &ScopeRegistry) -> Vec<String> {
 fn render_preamble(names: &[String]) -> String {
     let mut out = String::from("# Clear any previous cmd-man definitions.\n");
     out.push_str("if typeset -f _cmdman_forget >/dev/null 2>&1; then\n");
-    out.push_str("  _cmdman_forget\n");
+    out.push_str("  \\_cmdman_forget\n");
     out.push_str("fi\n");
     out.push_str("function _cmdman_forget {\n");
     if names.is_empty() {
@@ -339,7 +341,7 @@ fn render_preamble(names: &[String]) -> String {
         out.push_str(&render_clearing(name, "  "));
     }
     out.push_str("}\n");
-    out.push_str("_cmdman_forget\n");
+    out.push_str("\\_cmdman_forget\n");
     out.push('\n');
     out
 }
@@ -843,11 +845,11 @@ mod tests {
             let preamble = preamble_of(&out);
             // The previous generation's copy runs before it is replaced, so a
             // name this generation dropped is still cleared.
-            let call_old = preamble.find("  _cmdman_forget\n").unwrap();
+            let call_old = preamble.find("  \\_cmdman_forget\n").unwrap();
             let define = preamble.find("function _cmdman_forget {").unwrap();
             assert!(call_old < define, "preamble was: {preamble}");
             assert!(
-                preamble.ends_with("}\n_cmdman_forget"),
+                preamble.ends_with("}\n\\_cmdman_forget"),
                 "the new copy must run too: {preamble}"
             );
             assert!(

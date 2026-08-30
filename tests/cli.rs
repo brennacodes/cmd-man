@@ -303,7 +303,7 @@ fn an_entry_whose_name_carries_shell_syntax_warns_and_is_not_rendered() {
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "cannot be defined in a shell file and is not defined",
+            "is not defined: '\\n' is not allowed",
         ));
 
     cmd(&home).args(["reload"]).assert().success();

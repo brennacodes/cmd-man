@@ -132,35 +132,11 @@ impl Entry {
 
     /// Validate required fields and the shape of the trigger alias.
     ///
-    /// The alias must be a usable shell trigger: non-empty, no whitespace, and
-    /// free of characters that would break an `alias`/function definition.
+    /// The alias must be a usable shell trigger, on exactly the terms the
+    /// renderer enforces, so nothing `validate` accepts is later dropped.
     pub fn validate(&self) -> Result<(), String> {
-        if self.name.trim().is_empty() {
-            return Err("alias cannot be empty".into());
-        }
-        if self.name.chars().any(|c| c.is_whitespace()) {
-            return Err(format!("alias '{}' cannot contain whitespace", self.name));
-        }
-        // A trigger alias must be a plain shell word. Allow letters, digits, and
-        // the small set of punctuation that is safe in an alias/function name.
-        if let Some(bad) = self
-            .name
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
-        {
-            return Err(format!("alias '{}' cannot contain '{bad}'", self.name));
-        }
-        // A leading hyphen turns the alias into an option wherever it is passed
-        // to a shell builtin.
-        if self.name.starts_with('-') {
-            return Err(format!("alias '{}' cannot start with '-'", self.name));
-        }
-        if self.name.starts_with(RESERVED_NAME_PREFIX) {
-            return Err(format!(
-                "alias '{}' cannot start with '{RESERVED_NAME_PREFIX}': cmd-man's own \
-                 shell helpers use that prefix",
-                self.name
-            ));
+        if let Some(problem) = name_problem(&self.name) {
+            return Err(format!("alias '{}': {problem}", self.name));
         }
         if self.command.trim().is_empty() {
             return Err(format!("alias '{}' must have a command", self.name));
@@ -190,16 +166,67 @@ impl Entry {
 /// its command run on every `cd` or every re-source.
 pub const RESERVED_NAME_PREFIX: &str = "_cmdman_";
 
-/// Whether `name` is a plain shell word the generated files may define: the
-/// gate the renderer relies on, since a name reaching it off disk never went
-/// through [`Entry::validate`]. Everything `validate` accepts satisfies this.
+/// The words the generated shell files use as syntax or invoke as commands.
+///
+/// An alias is expanded where the shell parses a command word, so an entry
+/// taking one of these names rewrites the generated file's own code the moment
+/// that file is sourced. `local` is the worst case: it opens `_cmdman_apply`,
+/// which runs on every `cd`. Keep this in step with what `shell::render` emits.
+const RESERVED_NAMES: &[&str] = &[
+    "add-zsh-hook",
+    "alias",
+    "autoload",
+    "case",
+    "esac",
+    "fi",
+    "function",
+    "if",
+    "in",
+    "local",
+    "return",
+    "then",
+    "typeset",
+    "unalias",
+    "unset",
+];
+
+/// Why `name` cannot be written into a generated shell file, or `None` when it
+/// can. This is the gate the renderer relies on, since a name reaching it off
+/// disk never went through [`Entry::validate`].
+pub fn name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("an alias cannot be empty".into());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    {
+        // Debug-format it: the character may itself be a newline, and the
+        // message travels to a terminal one line at a time.
+        return Some(format!(
+            "{bad:?} is not allowed: use letters, digits, '_', '-' and '.'"
+        ));
+    }
+    if name.starts_with('-') {
+        return Some("an alias cannot start with '-'".into());
+    }
+    if name.starts_with(RESERVED_NAME_PREFIX) {
+        return Some(format!(
+            "'{RESERVED_NAME_PREFIX}' is reserved for cmd-man's own shell helpers"
+        ));
+    }
+    if RESERVED_NAMES.contains(&name) {
+        return Some(format!(
+            "'{name}' is shell syntax the generated file itself uses"
+        ));
+    }
+    None
+}
+
+/// Whether `name` may be written into a generated shell file. Everything
+/// [`Entry::validate`] accepts satisfies this.
 pub fn is_usable_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
-        && !name.starts_with(RESERVED_NAME_PREFIX)
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    name_problem(name).is_none()
 }
 
 /// Identifies an entry: a name plus the scope it lives in.
@@ -311,6 +338,22 @@ mod tests {
         }
         assert!(is_usable_name("_cmdman"));
         assert!(is_usable_name("_myhelper"));
+    }
+
+    #[test]
+    fn a_name_the_generated_file_uses_as_syntax_is_refused_and_unusable() {
+        // An alias is expanded wherever the shell parses a command word, so
+        // such a name would rewrite the generated file's own code. `local`
+        // opens the dispatcher, which runs on every cd.
+        for bad in RESERVED_NAMES {
+            let e = Entry::new(*bad, Kind::Alias, "echo pwned", "desc");
+            assert!(e.validate().is_err(), "expected '{bad}' to be rejected");
+            assert!(!is_usable_name(bad), "expected '{bad}' to be unusable");
+        }
+        // Only exact matches: these merely contain or extend a reserved word.
+        for good in ["locale", "aliases", "my-alias", "Local", "returns"] {
+            assert!(is_usable_name(good), "expected '{good}' to stay usable");
+        }
     }
 
     #[test]

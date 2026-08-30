@@ -10,7 +10,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::capture::{self, Assessment, CaptureResult};
 use crate::config::Config;
-use crate::model::{CapturePolicy, Entry, EntryKey};
+use crate::model::{self, CapturePolicy, Entry, EntryKey};
 use crate::paths::{self, Paths};
 use crate::scopes::{self, Placement, Scope, ScopeRegistry, Target, one_line};
 use crate::search::{Filter, search};
@@ -125,19 +125,15 @@ impl App {
             .store
             .entries()
             .iter()
-            .filter(|e| !e.has_usable_name())
-            .map(|e| one_line(&e.name))
+            .filter_map(|e| {
+                model::name_problem(&e.name).map(|problem| {
+                    format!("alias '{}' is not defined: {problem}", one_line(&e.name))
+                })
+            })
             .collect();
         unusable.sort();
         unusable.dedup();
-        for name in unusable {
-            self.notices.push(format!(
-                "alias '{name}' cannot be defined in a shell file and is not defined: \
-                 use letters, digits, '_', '-' and '.', and do not start with '-' or \
-                 '{}'",
-                crate::model::RESERVED_NAME_PREFIX
-            ));
-        }
+        self.notices.append(&mut unusable);
         self
     }
 
