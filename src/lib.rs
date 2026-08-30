@@ -8,6 +8,7 @@ pub mod config;
 pub mod model;
 pub mod paths;
 pub mod proc;
+pub mod scopes;
 pub mod search;
 pub mod shell;
 pub mod store;
