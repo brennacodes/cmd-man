@@ -19,6 +19,9 @@ const RESERVED_IDS: [&str; 3] = ["global", "all", "here"];
 pub struct Scope {
     pub id: String,
     pub path: String,
+    /// Metadata only, so a hand edit or a sync merge that drops it degrades to
+    /// an empty stamp rather than making the whole registry unloadable.
+    #[serde(default)]
     pub created_at: String,
 }
 
@@ -686,6 +689,24 @@ mod tests {
         let again = ScopeRegistry::load(&paths).unwrap();
         assert_eq!(again.find("api").unwrap().path, "$HOME/work/api");
         assert!(again.issues().is_empty());
+    }
+
+    #[test]
+    fn a_scope_missing_its_timestamp_still_loads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.scopes_file(),
+            "[[scope]]\nid = \"api\"\npath = \"$HOME/work/api\"\n",
+        )
+        .unwrap();
+
+        let reg = ScopeRegistry::load(&paths).unwrap();
+        let found = reg.find("api").unwrap();
+        assert_eq!(found.path, "$HOME/work/api");
+        assert_eq!(found.created_at, "");
+        assert!(reg.issues().is_empty());
     }
 
     #[test]
