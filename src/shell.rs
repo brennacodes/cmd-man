@@ -106,20 +106,9 @@ fn write_shell_file(paths: &Paths, shell: Shell, entries: &[Entry]) -> Result<()
     Ok(())
 }
 
-/// Express a path using `$HOME` when it lives under the home directory, so the
-/// rc block stays portable across machines.
-fn portable_path(path: &Path) -> String {
-    if let Some(home) = home_dir()
-        && let Ok(rest) = path.strip_prefix(&home)
-    {
-        return format!("$HOME/{}", rest.display());
-    }
-    path.display().to_string()
-}
-
 /// The managed rc block that sources a generated shell file.
 fn rc_block(shell_file: &Path) -> String {
-    let p = portable_path(shell_file);
+    let p = crate::paths::portable_path(shell_file);
     format!(
         "{BLOCK_START}\n# Managed by cmd-man. Re-run `cmd-man init` to refresh.\n[ -f \"{p}\" ] && source \"{p}\"\n{BLOCK_END}\n"
     )
