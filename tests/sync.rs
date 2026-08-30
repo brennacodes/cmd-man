@@ -10,6 +10,7 @@ use cmd_man::backup;
 use cmd_man::config::Config;
 use cmd_man::model::{Entry, EntryKey, Kind};
 use cmd_man::paths::Paths;
+use cmd_man::scopes::{Scope, ScopeRegistry};
 use cmd_man::shell::Shell;
 use cmd_man::store::Store;
 use tempfile::TempDir;
@@ -58,6 +59,27 @@ fn seed_store_in(paths: &Paths, name: &str, command: &str, category: &str) {
     entry.category = category.to_string();
     store.add(entry).unwrap();
     store.save(paths).unwrap();
+}
+
+/// Seed a store holding a single entry that belongs to the given scope id.
+fn seed_scoped_store_in(paths: &Paths, name: &str, command: &str, scope: &str) {
+    paths.ensure_dirs().unwrap();
+    let mut store = Store::default();
+    let mut entry = Entry::new(name, Kind::Alias, command, "desc");
+    entry.scope = Some(scope.to_string());
+    store.add(entry).unwrap();
+    store.save(paths).unwrap();
+}
+
+fn seed_scope(paths: &Paths, id: &str, path: &str) {
+    paths.ensure_dirs().unwrap();
+    let mut registry = ScopeRegistry::load(paths).unwrap();
+    registry.insert(Scope {
+        id: id.to_string(),
+        path: path.to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+    });
+    registry.save(paths).unwrap();
 }
 
 fn clone_url_into(url: &str, dest: &Path) {
@@ -241,4 +263,63 @@ fn add_triggers_background_push() {
         pushed,
         "background sync did not push to the remote within the timeout"
     );
+}
+
+#[test]
+fn scopes_file_round_trips_through_the_remote() {
+    ensure_git_identity();
+    let bare = bare_remote();
+    let url = bare.path().to_str().unwrap();
+    let config = config_with_remote(url);
+
+    let a = TempDir::new().unwrap();
+    let paths_a = Paths::with_root(a.path().to_path_buf());
+    seed_store(&paths_a, "ll", "ls -la");
+    seed_scope(&paths_a, "api", "$HOME/work/api");
+    backup::run_sync(&paths_a, &config, "2026-08-29T00:00:00Z").unwrap();
+
+    let b = TempDir::new().unwrap();
+    let paths_b = Paths::with_root(b.path().to_path_buf());
+    paths_b.ensure_dirs().unwrap();
+    backup::run_sync(&paths_b, &config, "2026-08-29T00:00:01Z").unwrap();
+
+    let status = backup::read_status(&paths_b).unwrap();
+    assert_eq!(
+        status.outcome, "bootstrapped",
+        "message: {}",
+        status.message
+    );
+
+    let pulled = ScopeRegistry::load(&paths_b).unwrap();
+    let scope = pulled
+        .find("api")
+        .expect("scope registry did not travel to the other machine");
+    assert_eq!(scope.path, "$HOME/work/api");
+}
+
+#[test]
+fn a_pull_regenerates_scope_blocks() {
+    ensure_git_identity();
+    let bare = bare_remote();
+    let url = bare.path().to_str().unwrap();
+    let config = config_with_remote(url);
+
+    let a = TempDir::new().unwrap();
+    let paths_a = Paths::with_root(a.path().to_path_buf());
+    seed_scoped_store_in(&paths_a, "ll", "ls -lah", "api");
+    seed_scope(&paths_a, "api", "/tmp/cmd-man-scope-api");
+    backup::run_sync(&paths_a, &config, "2026-08-29T00:00:00Z").unwrap();
+
+    let b = TempDir::new().unwrap();
+    let paths_b = Paths::with_root(b.path().to_path_buf());
+    paths_b.ensure_dirs().unwrap();
+    backup::run_sync(&paths_b, &config, "2026-08-29T00:00:01Z").unwrap();
+
+    let zsh = std::fs::read_to_string(paths_b.shell_file(Shell::Zsh)).unwrap();
+    assert!(
+        zsh.contains("_cmdman_dir_1='/tmp/cmd-man-scope-api'"),
+        "zsh was: {zsh}"
+    );
+    assert!(zsh.contains("_cmdman_on_1"), "zsh was: {zsh}");
+    assert!(zsh.contains("ls -lah"), "zsh was: {zsh}");
 }
