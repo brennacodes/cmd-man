@@ -1,7 +1,7 @@
 //! Turning stored entries into live shell definitions, wiring up rc files,
 //! and importing a user's currently active aliases/functions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -10,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use wait_timeout::ChildExt;
 
 use crate::model::{Entry, Kind};
-use crate::paths::{Paths, home_dir};
-use crate::scopes::ScopeRegistry;
+use crate::paths::{self, Paths, home_dir};
+use crate::scopes::{Scope, ScopeRegistry, path_contains};
 
 /// A supported interactive shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +68,211 @@ pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String
     ));
     out.push_str(&render_preamble(&managed_names(entries, scopes)));
 
-    for entry in globals {
+    for entry in &globals {
         out.push_str(&render_entry(entry, ""));
         out.push('\n');
     }
+
+    let rendered = rendered_scopes(entries, scopes);
+    if rendered.is_empty() {
+        out.push_str(RETIRE_DISPATCHER);
+        return out;
+    }
+
+    let by_name: HashMap<&str, &Entry> = globals.iter().map(|e| (e.name.as_str(), *e)).collect();
+    for index in 0..rendered.len() {
+        out.push_str(&render_scope_block(&rendered, index, &by_name));
+    }
+    out.push_str(&render_dispatcher(rendered.len()));
+    out.push_str(render_hook(shell));
+    out.push_str(&render_state_reset(rendered.len()));
+    out
+}
+
+/// The scopes that get a block, in render order, each paired with its entries
+/// sorted by name. Scopes without entries are skipped so indices stay
+/// contiguous, and entries naming a scope that is not rendered are dropped.
+fn rendered_scopes<'a>(
+    entries: &'a [Entry],
+    scopes: &'a ScopeRegistry,
+) -> Vec<(&'a Scope, Vec<&'a Entry>)> {
+    let mut rendered = Vec::new();
+    for scope in scopes.render_order() {
+        let mut owned: Vec<&Entry> = entries
+            .iter()
+            .filter(|e| e.scope.as_deref() == Some(scope.id.as_str()))
+            .collect();
+        if owned.is_empty() {
+            continue;
+        }
+        owned.sort_by(|a, b| a.name.cmp(&b.name));
+        rendered.push((scope, owned));
+    }
+    rendered
+}
+
+fn resolved_path_of(scope: &Scope) -> PathBuf {
+    paths::expand_path(&scope.path)
+}
+
+/// The definition an `off` block must put back for `name`: the nearest
+/// statically enclosing rendered scope that also defines it, else the global
+/// entry, else nothing.
+///
+/// Only earlier indices can enclose, because `render_order` sorts by path and
+/// a parent always precedes its descendants.
+fn restore_target<'a>(
+    rendered: &[(&'a Scope, Vec<&'a Entry>)],
+    index: usize,
+    name: &str,
+    globals: &HashMap<&str, &'a Entry>,
+) -> Option<&'a Entry> {
+    let dir = resolved_path_of(rendered[index].0);
+    for (scope, entries) in rendered[..index].iter().rev() {
+        if !path_contains(&resolved_path_of(scope), &dir) {
+            continue;
+        }
+        if let Some(entry) = entries.iter().find(|e| e.name == name) {
+            return Some(entry);
+        }
+    }
+    globals.get(name).copied()
+}
+
+/// The directory variable and the `on`/`off` pair for one scope.
+fn render_scope_block(
+    rendered: &[(&Scope, Vec<&Entry>)],
+    index: usize,
+    globals: &HashMap<&str, &Entry>,
+) -> String {
+    let (scope, entries) = &rendered[index];
+    let n = index + 1;
+    let dir = resolved_path_of(scope);
+
+    let mut out = format!("# scope: {} ({})\n", scope.id, scope.path);
+    out.push_str(&format!(
+        "_cmdman_dir_{n}={}\n",
+        single_quote(&dir.display().to_string())
+    ));
+
+    out.push_str(&format!("function _cmdman_on_{n} {{\n"));
+    for entry in entries {
+        out.push_str(&render_entry(entry, "  "));
+    }
+    out.push_str("}\n");
+
+    out.push_str(&format!("function _cmdman_off_{n} {{\n"));
+    for entry in entries {
+        match restore_target(rendered, index, &entry.name, globals) {
+            Some(target) => out.push_str(&render_entry(target, "  ")),
+            None => out.push_str(&render_clearing(&entry.name, "  ")),
+        }
+    }
+    out.push_str("}\n\n");
+    out
+}
+
+/// Emitted instead of the dispatcher, the hook and the state reset when there
+/// is nothing to scope. Nothing is registered with the shell, so a scope-free
+/// install leaves `chpwd` and `PROMPT_COMMAND` alone.
+///
+/// The inert definition is still needed: a shell that re-sources after the last
+/// scope went away keeps the previous render's registration and its
+/// `_cmdman_on_N` blocks, so without replacing `_cmdman_apply` the next `cd`
+/// would resurrect a definition the store no longer has. `return $?` passes the
+/// caller's status through untouched.
+const RETIRE_DISPATCHER: &str = "function _cmdman_apply {\n  return $?\n}\n";
+
+/// The dispatcher wired to the shell's directory-change hook. It never forks:
+/// every test is a `case` against `$PWD`, and `pwd -P` is far too slow to run
+/// on each prompt.
+fn render_dispatcher(count: usize) -> String {
+    let mut out = String::from("function _cmdman_apply {\n");
+    // `$?` must survive: in bash this runs after every command.
+    out.push_str("  local _rc=$?\n");
+    out.push_str("  if [ \"${_cmdman_lastpwd-}\" = \"$PWD\" ]; then\n");
+    out.push_str("    return $_rc\n");
+    out.push_str("  fi\n");
+    out.push_str("  _cmdman_lastpwd=$PWD\n\n");
+
+    for n in 1..=count {
+        out.push_str(&format!("  local _n{n}=0\n"));
+        out.push_str(&format!(
+            "  case \"$PWD/\" in \"${{_cmdman_dir_{n}%/}}\"/*) _n{n}=1 ;; esac\n"
+        ));
+    }
+    out.push('\n');
+
+    // Descending teardown then ascending setup leaves the deepest active
+    // scope's definitions on top when one `cd` crosses several boundaries.
+    for n in (1..=count).rev() {
+        out.push_str(&format!(
+            "  if [ \"$_n{n}\" = 0 ] && [ \"${{_cmdman_was_{n}-0}}\" = 1 ]; then _cmdman_off_{n}; fi\n"
+        ));
+    }
+    for n in 1..=count {
+        out.push_str(&format!(
+            "  if [ \"$_n{n}\" = 1 ] && [ \"${{_cmdman_was_{n}-0}}\" = 0 ]; then _cmdman_on_{n}; fi\n"
+        ));
+    }
+    out.push('\n');
+
+    // Recorded after all the toggling so every test in a pass sees the same
+    // pre-pass state.
+    for n in 1..=count {
+        out.push_str(&format!("  _cmdman_was_{n}=$_n{n}\n"));
+    }
+    out.push_str("  return $_rc\n");
+    out.push_str("}\n\n");
+    out
+}
+
+/// Register the dispatcher with the shell's directory-change hook, without
+/// adding a second copy when the file is re-sourced.
+fn render_hook(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Zsh => ZSH_HOOK,
+        Shell::Bash => BASH_HOOK,
+    }
+}
+
+/// The fallback branch keys off `add-zsh-hook` failing, not off the name
+/// resolving: `autoload -Uz` always creates a stub, so `command -v` finds one
+/// even when the function file is missing from `fpath` and the call then fails.
+/// `add-zsh-hook` is itself idempotent, so a re-source cannot register twice on
+/// either branch.
+const ZSH_HOOK: &str = r#"autoload -Uz add-zsh-hook 2>/dev/null
+if ! add-zsh-hook chpwd _cmdman_apply 2>/dev/null; then
+  case " ${chpwd_functions[*]-} " in
+    *" _cmdman_apply "*) ;;
+    *) chpwd_functions+=(_cmdman_apply) ;;
+  esac
+fi
+
+"#;
+
+/// `PROMPT_COMMAND` is a string, not an array: macOS ships bash 3.2, which has
+/// no array form. cmd-man appends rather than prepends so it cannot corrupt a
+/// prompt the user's own hook is building.
+const BASH_HOOK: &str = r#"case "${PROMPT_COMMAND-}" in
+  *_cmdman_apply*) ;;
+  "") PROMPT_COMMAND="_cmdman_apply" ;;
+  *) PROMPT_COMMAND="$PROMPT_COMMAND;_cmdman_apply" ;;
+esac
+
+"#;
+
+/// Reset the dispatcher's memory, then prime it for the current directory.
+///
+/// The reset is what makes re-sourcing work: a shell already inside a scope
+/// still has `_cmdman_was_N=1`, so without it the priming call sees no
+/// transition and the definitions the preamble just cleared never come back.
+fn render_state_reset(count: usize) -> String {
+    let mut out = String::from("_cmdman_lastpwd=''\n");
+    for n in 1..=count {
+        out.push_str(&format!("_cmdman_was_{n}=0\n"));
+    }
+    out.push_str("_cmdman_apply\n");
     out
 }
 
@@ -96,28 +297,35 @@ fn managed_names(entries: &[Entry], scopes: &ScopeRegistry) -> Vec<String> {
 
 /// Clear both namespaces for every managed name so a re-source starts from a
 /// known state, whichever kind each name was defined as last time.
-///
-/// The `--` is load bearing: without it a name such as `-a` is parsed as an
-/// option, and `unalias -a` deletes every alias in the user's shell.
 fn render_preamble(names: &[String]) -> String {
     let mut out = String::from("# Clear any previous cmd-man definitions.\n");
     for name in names {
-        out.push_str(&format!("unalias -- {name} 2>/dev/null\n"));
-        out.push_str(&format!("unset -f -- {name} 2>/dev/null\n"));
+        out.push_str(&render_clearing(name, ""));
     }
     out.push('\n');
     out
+}
+
+/// Drop a name from both namespaces.
+///
+/// The `--` is load bearing: without it a name such as `-a` is parsed as an
+/// option, and `unalias -a` deletes every alias in the user's shell.
+fn render_clearing(name: &str, indent: &str) -> String {
+    format!("{indent}unalias -- {name} 2>/dev/null\n{indent}unset -f -- {name} 2>/dev/null\n")
 }
 
 /// Render one definition, clearing the other namespace first because an alias
 /// outranks a function of the same name at lookup time. Functions use the
 /// `function NAME { }` keyword form: with an alias of that name still live, zsh
 /// expands the name in the `NAME() {` form and aborts the rest of the file.
+///
+/// `indent` shifts the wrapper only. A function body is emitted verbatim at
+/// column zero because shell bodies are whitespace sensitive: an indented
+/// heredoc terminator never closes its heredoc, which would swallow the rest of
+/// the generated file.
 fn render_entry(entry: &Entry, indent: &str) -> String {
     let name = &entry.name;
-    let mut out = String::new();
-    out.push_str(&format!("{indent}unalias -- {name} 2>/dev/null\n"));
-    out.push_str(&format!("{indent}unset -f -- {name} 2>/dev/null\n"));
+    let mut out = render_clearing(name, indent);
     match entry.kind {
         Kind::Alias => out.push_str(&format!(
             "{indent}alias {name}={}\n",
@@ -126,7 +334,8 @@ fn render_entry(entry: &Entry, indent: &str) -> String {
         Kind::Function => {
             out.push_str(&format!("{indent}function {name} {{\n"));
             for line in entry.command.lines() {
-                out.push_str(&format!("{indent}{line}\n"));
+                out.push_str(line);
+                out.push('\n');
             }
             out.push_str(&format!("{indent}}}\n"));
         }
@@ -472,6 +681,35 @@ mod tests {
         Entry::new(name, Kind::Function, command, "d")
     }
 
+    fn reg(pairs: &[(&str, &str)]) -> ScopeRegistry {
+        ScopeRegistry::from_scopes(
+            pairs
+                .iter()
+                .map(|(id, path)| Scope {
+                    id: (*id).into(),
+                    path: (*path).into(),
+                    created_at: "t".into(),
+                })
+                .collect(),
+        )
+    }
+
+    fn scoped(name: &str, command: &str, scope: &str) -> Entry {
+        let mut e = alias_entry(name, command);
+        e.scope = Some(scope.into());
+        e
+    }
+
+    /// The text from `marker` up to the next line that is exactly `}`.
+    fn section<'a>(out: &'a str, marker: &str) -> &'a str {
+        let start = out
+            .find(marker)
+            .unwrap_or_else(|| panic!("no {marker} in: {out}"));
+        let rest = &out[start..];
+        let end = rest.find("\n}").map(|i| start + i + 2).unwrap_or(out.len());
+        &out[start..end]
+    }
+
     #[test]
     fn renders_alias_and_function() {
         let mut entries = vec![
@@ -583,6 +821,266 @@ mod tests {
             out.matches("unset -f -- -a 2>/dev/null").count(),
             2,
             "out was: {out}"
+        );
+    }
+
+    #[test]
+    fn scope_indices_follow_path_order_not_id_order() {
+        let scopes = reg(&[("zeta", "/aaa"), ("alpha", "/aaa/bbb")]);
+        let entries = vec![
+            scoped("x", "echo x", "zeta"),
+            scoped("y", "echo y", "alpha"),
+        ];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        assert!(out.contains("_cmdman_dir_1='/aaa'"), "out was: {out}");
+        assert!(out.contains("_cmdman_dir_2='/aaa/bbb'"), "out was: {out}");
+    }
+
+    #[test]
+    fn off_block_restores_the_shadowed_global() {
+        let scopes = reg(&[("api", "/w/api")]);
+        let entries = vec![alias_entry("ll", "ls -la"), scoped("ll", "ls -lah", "api")];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        let on = section(&out, "function _cmdman_on_1 {");
+        let off = section(&out, "function _cmdman_off_1 {");
+        assert!(on.contains("alias ll='ls -lah'"), "on was: {on}");
+        assert!(off.contains("alias ll='ls -la'"), "off was: {off}");
+        assert!(off.contains("unalias -- ll 2>/dev/null"), "off was: {off}");
+        assert!(off.contains("unset -f -- ll 2>/dev/null"), "off was: {off}");
+    }
+
+    #[test]
+    fn off_block_of_a_nested_scope_restores_the_enclosing_scope() {
+        let scopes = reg(&[("work", "/w"), ("api", "/w/api")]);
+        let entries = vec![
+            alias_entry("dep", "echo global"),
+            scoped("dep", "./deploy.sh --staging", "work"),
+            scoped("dep", "./deploy.sh --api", "api"),
+        ];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        let off_inner = section(&out, "function _cmdman_off_2 {");
+        let off_outer = section(&out, "function _cmdman_off_1 {");
+        assert!(
+            off_inner.contains("alias dep='./deploy.sh --staging'"),
+            "the inner teardown must restore the enclosing scope, not the global: {off_inner}"
+        );
+        assert!(
+            off_outer.contains("alias dep='echo global'"),
+            "off_outer was: {off_outer}"
+        );
+    }
+
+    #[test]
+    fn off_block_restores_a_shadowed_function() {
+        let scopes = reg(&[("api", "/w/api")]);
+        let entries = vec![
+            function_entry("dep", "echo global"),
+            scoped("dep", "echo scoped", "api"),
+        ];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        let off = section(&out, "function _cmdman_off_1 {");
+        assert!(off.contains("unalias -- dep 2>/dev/null"), "off was: {off}");
+        assert!(off.contains("function dep {"), "off was: {off}");
+    }
+
+    #[test]
+    fn off_block_of_a_scope_only_name_defines_nothing() {
+        let scopes = reg(&[("api", "/w/api")]);
+        let entries = vec![scoped("deploy", "echo deploy", "api")];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        let off = section(&out, "function _cmdman_off_1 {");
+        assert!(
+            off.contains("unalias -- deploy 2>/dev/null"),
+            "off was: {off}"
+        );
+        assert!(!off.contains("alias deploy="), "off was: {off}");
+    }
+
+    #[test]
+    fn dispatcher_toggles_off_descending_and_on_ascending() {
+        let scopes = reg(&[("api", "/w/api"), ("svc", "/w/api/svc")]);
+        let entries = vec![scoped("a", "echo a", "api"), scoped("b", "echo b", "svc")];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        let apply = section(&out, "function _cmdman_apply {");
+        let off2 = apply.find("_cmdman_off_2").unwrap();
+        let off1 = apply.find("_cmdman_off_1").unwrap();
+        let on1 = apply.find("_cmdman_on_1").unwrap();
+        let on2 = apply.find("_cmdman_on_2").unwrap();
+        assert!(off2 < off1 && off1 < on1 && on1 < on2, "apply was: {apply}");
+    }
+
+    #[test]
+    fn dispatcher_matches_on_a_component_boundary() {
+        let scopes = reg(&[("api", "/w/api")]);
+        let entries = vec![scoped("a", "echo a", "api")];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        assert!(
+            out.contains(r#"case "$PWD/" in "${_cmdman_dir_1%/}"/*)"#),
+            "out was: {out}"
+        );
+    }
+
+    #[test]
+    fn state_is_reset_before_the_priming_call() {
+        let scopes = reg(&[("api", "/w/api")]);
+        let entries = vec![scoped("a", "echo a", "api")];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        let reset = out.find("_cmdman_lastpwd=''").unwrap();
+        let was = out.find("_cmdman_was_1=0").unwrap();
+        let prime = out.rfind("_cmdman_apply").unwrap();
+        assert!(reset < prime && was < prime, "out was: {out}");
+    }
+
+    #[test]
+    fn zsh_uses_chpwd_and_bash_uses_prompt_command() {
+        let scopes = reg(&[("api", "/w/api")]);
+        let entries = vec![scoped("a", "echo a", "api")];
+        let zsh = render(Shell::Zsh, &entries, &scopes);
+        let bash = render(Shell::Bash, &entries, &scopes);
+        assert!(zsh.contains("chpwd_functions"), "zsh was: {zsh}");
+        assert!(!zsh.contains("PROMPT_COMMAND"), "zsh was: {zsh}");
+        assert!(bash.contains("PROMPT_COMMAND"), "bash was: {bash}");
+        assert!(bash.contains("_cmdman_apply"), "bash was: {bash}");
+    }
+
+    #[test]
+    fn the_zsh_hook_registers_when_add_zsh_hook_cannot_load() {
+        // `autoload -Uz` always defines a stub, so a guard on `command -v
+        // add-zsh-hook` is true even when the function file is off `fpath` and
+        // the call fails. Emptying `fpath` is that case.
+        let dir = tempfile::tempdir().unwrap();
+        let scope_dir = dir.path().join("api");
+        std::fs::create_dir_all(&scope_dir).unwrap();
+        let scopes = reg(&[("api", scope_dir.to_str().unwrap())]);
+        let entries = vec![scoped("dep", "echo scoped", "api")];
+        let file = dir.path().join("cmd-man.zsh");
+        std::fs::write(&file, render(Shell::Zsh, &entries, &scopes)).unwrap();
+
+        let script = format!(
+            "fpath=(); source '{}'; print \"hooks=[${{chpwd_functions[*]-}}]\"; cd '{}'; alias dep",
+            file.display(),
+            scope_dir.display()
+        );
+        let Ok(out) = Command::new("zsh")
+            .arg("-f")
+            .arg("-c")
+            .arg(&script)
+            .output()
+        else {
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("hooks=[_cmdman_apply]"),
+            "zsh said: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("dep='echo scoped'"),
+            "zsh said: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn entries_in_unknown_scopes_are_not_rendered_anywhere() {
+        let scopes = reg(&[]);
+        let entries = vec![scoped("ghost", "echo boo", "gone")];
+        let out = render(Shell::Zsh, &entries, &scopes);
+        assert!(!out.contains("ghost"), "out was: {out}");
+    }
+
+    #[test]
+    fn a_scope_with_no_entries_emits_no_block() {
+        let scopes = reg(&[("empty", "/w/empty")]);
+        let out = render(Shell::Zsh, &[], &scopes);
+        assert!(!out.contains("_cmdman_dir_1"), "out was: {out}");
+        assert!(!out.contains("_cmdman_on_1"), "out was: {out}");
+        assert!(!out.contains("_cmdman_off_1"), "out was: {out}");
+    }
+
+    #[test]
+    fn a_scope_free_render_installs_no_hook() {
+        let zsh = render(
+            Shell::Zsh,
+            &[alias_entry("ll", "ls -la")],
+            &ScopeRegistry::default(),
+        );
+        let bash = render(
+            Shell::Bash,
+            &[alias_entry("ll", "ls -la")],
+            &ScopeRegistry::default(),
+        );
+        assert!(!zsh.contains("chpwd"), "zsh was: {zsh}");
+        assert!(!bash.contains("PROMPT_COMMAND"), "bash was: {bash}");
+        assert!(!zsh.contains("_cmdman_lastpwd=''"), "zsh was: {zsh}");
+        assert!(!zsh.trim_end().ends_with("_cmdman_apply"), "zsh was: {zsh}");
+    }
+
+    #[test]
+    fn a_scope_free_render_retires_the_dispatcher() {
+        // Removing the last scoped entry must retire the dispatcher a previous
+        // render installed. Without this, re-sourcing leaves the old
+        // `_cmdman_apply` live and the next `cd` out of the deleted scope runs
+        // a stale `off` block that resurrects a definition the store no longer
+        // has.
+        let out = render(
+            Shell::Zsh,
+            &[alias_entry("ll", "ls -la")],
+            &ScopeRegistry::default(),
+        );
+        assert!(
+            out.trim_end()
+                .ends_with("function _cmdman_apply {\n  return $?\n}"),
+            "out was: {out}"
+        );
+        assert_parses("zsh", &out);
+        assert_parses("bash", &render(Shell::Bash, &[], &ScopeRegistry::default()));
+    }
+
+    #[test]
+    fn a_scoped_function_body_is_not_indented() {
+        // A heredoc terminator only closes its heredoc at the start of a line,
+        // so the wrapper is indented but the body never is.
+        let scopes = reg(&[("api", "/w/api")]);
+        let mut entry = function_entry("note", "cat <<EOF\nhello from api\nEOF");
+        entry.scope = Some("api".into());
+        let out = render(Shell::Zsh, &[entry], &scopes);
+        assert!(
+            out.contains("  function note {\ncat <<EOF\nhello from api\nEOF\n  }\n"),
+            "out was: {out}"
+        );
+    }
+
+    #[test]
+    fn a_generated_file_with_scopes_parses_in_both_shells() {
+        let scopes = reg(&[("work", "/w"), ("api", "/w/api")]);
+        let mut heredoc = function_entry("note", "cat <<EOF\nhello from api\nEOF");
+        heredoc.scope = Some("api".into());
+        let entries = vec![
+            alias_entry("ll", "ls -la"),
+            function_entry("gnote", "cat <<EOF\nhello global\nEOF"),
+            scoped("ll", "ls -lah", "work"),
+            heredoc,
+        ];
+        for (shell, bin) in [(Shell::Zsh, "zsh"), (Shell::Bash, "bash")] {
+            assert_parses(bin, &render(shell, &entries, &scopes));
+        }
+    }
+
+    /// Syntax-check generated text with a real shell, skipping when that shell
+    /// is not installed. `-n` parses the whole file without running it.
+    fn assert_parses(bin: &str, text: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("generated.sh");
+        std::fs::write(&file, text).unwrap();
+        let Ok(out) = Command::new(bin).arg("-n").arg(&file).output() else {
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "{bin} rejected the generated file: {}\n{text}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
