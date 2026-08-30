@@ -220,5 +220,5 @@ fn function_kind_generates_function_definition() {
         .success();
 
     let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
-    assert!(zsh.contains("hi() {"), "zsh was: {zsh}");
+    assert!(zsh.contains("function hi {"), "zsh was: {zsh}");
 }

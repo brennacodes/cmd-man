@@ -16,6 +16,7 @@ use crate::app::now_timestamp;
 use crate::config::{BackupConfig, Config};
 use crate::paths::Paths;
 use crate::proc::own_process_group;
+use crate::scopes::ScopeRegistry;
 use crate::shell;
 use crate::store::Store;
 
@@ -303,9 +304,11 @@ fn ensure_remote_exists(
 
 fn regenerate_shells(paths: &Paths, config: &Config) -> Result<()> {
     let store = Store::load(paths)?;
+    let scopes = ScopeRegistry::load(paths)?;
     shell::regenerate(
         paths,
         store.entries(),
+        &scopes,
         config.shells.zsh,
         config.shells.bash,
     )

@@ -142,6 +142,11 @@ impl Entry {
         {
             return Err(format!("alias '{}' cannot contain '{bad}'", self.name));
         }
+        // A leading hyphen turns the alias into an option wherever it is passed
+        // to a shell builtin.
+        if self.name.starts_with('-') {
+            return Err(format!("alias '{}' cannot start with '-'", self.name));
+        }
         if self.command.trim().is_empty() {
             return Err(format!("alias '{}' must have a command", self.name));
         }
@@ -236,6 +241,19 @@ mod tests {
             let e = Entry::new(bad, Kind::Alias, "echo hi", "desc");
             assert!(e.validate().is_err(), "expected '{bad}' to be rejected");
         }
+    }
+
+    #[test]
+    fn validate_rejects_a_leading_hyphen() {
+        for bad in ["-a", "-f", "--"] {
+            let e = Entry::new(bad, Kind::Alias, "echo hi", "desc");
+            assert!(e.validate().is_err(), "expected '{bad}' to be rejected");
+        }
+        assert!(
+            Entry::new("a-b", Kind::Alias, "echo hi", "desc")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

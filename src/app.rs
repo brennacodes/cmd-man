@@ -1,6 +1,8 @@
 //! Service layer shared by the CLI and TUI: loads state and centralizes every
 //! mutation so the store and generated shell files stay in sync.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -9,6 +11,7 @@ use crate::capture::{self, Assessment, CaptureResult};
 use crate::config::Config;
 use crate::model::{CapturePolicy, Entry, EntryKey};
 use crate::paths::Paths;
+use crate::scopes::ScopeRegistry;
 use crate::search::{Filter, search};
 use crate::shell;
 use crate::store::Store;
@@ -18,18 +21,29 @@ pub struct App {
     pub paths: Paths,
     pub config: Config,
     pub store: Store,
+    pub scopes: ScopeRegistry,
+    /// The working directory scope decisions are made against. A field rather
+    /// than a `current_dir()` call at each use site so placement, selection,
+    /// and filtering stay testable without mutating process state.
+    pub cwd: PathBuf,
+    /// Messages worth showing the user once, collected while loading state.
+    pub notices: Vec<String>,
 }
 
 impl App {
-    /// Load configuration and store from disk.
+    /// Load configuration, store, and scope registry from disk.
     pub fn load() -> Result<Self> {
         let paths = Paths::resolve()?;
         let config = Config::load(&paths)?;
         let store = Store::load(&paths)?;
+        let scopes = ScopeRegistry::load(&paths)?;
         Ok(App {
             paths,
             config,
             store,
+            scopes,
+            cwd: process_cwd(),
+            notices: Vec::new(),
         })
     }
 
@@ -39,13 +53,30 @@ impl App {
             paths,
             config,
             store,
+            scopes: ScopeRegistry::default(),
+            cwd: process_cwd(),
+            notices: Vec::new(),
         }
     }
 
-    /// Persist the store and regenerate the enabled shell files, then kick off a
-    /// background sync so the change is committed and pushed.
+    /// Replace the scope registry.
+    pub fn with_scopes(mut self, scopes: ScopeRegistry) -> Self {
+        self.scopes = scopes;
+        self
+    }
+
+    /// Replace the working directory scoping is resolved against.
+    pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
+        self.cwd = cwd;
+        self
+    }
+
+    /// Persist the store and the scope registry, regenerate the enabled shell
+    /// files, then kick off a background sync so the change is committed and
+    /// pushed.
     pub fn persist(&self) -> Result<()> {
         self.store.save(&self.paths)?;
+        self.scopes.save(&self.paths)?;
         self.regenerate_shells()?;
         crate::backup::spawn_sync(&self.paths);
         Ok(())
@@ -56,6 +87,7 @@ impl App {
         shell::regenerate(
             &self.paths,
             self.store.entries(),
+            &self.scopes,
             self.config.shells.zsh,
             self.config.shells.bash,
         )
@@ -142,6 +174,11 @@ impl App {
         }
         self.update(key, entry)
     }
+}
+
+/// The process working directory, falling back to `.` when it is unreadable.
+fn process_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// An RFC 3339 timestamp for the current instant.
