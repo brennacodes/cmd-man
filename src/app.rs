@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -15,6 +15,18 @@ use crate::scopes::{self, Placement, ScopeRegistry, Target};
 use crate::search::{Filter, search};
 use crate::shell;
 use crate::store::Store;
+
+/// How a command names which entry it means when a name exists more than once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection<'a> {
+    /// Prefer the entry the shell would run right now: the deepest active
+    /// scope, then global, then a lone candidate anywhere.
+    Auto,
+    /// A named scope id, or `global` for the unscoped entry.
+    In(&'a str),
+    /// Only a scope covering the working directory.
+    CurrentScope,
+}
 
 /// Loaded application state.
 pub struct App {
@@ -174,6 +186,50 @@ impl App {
         }
     }
 
+    /// Resolve a name the user typed into the single entry a command should
+    /// act on. Ambiguity is settled the way the shell settles it, so the CLI
+    /// and the live definitions can never disagree about which entry is meant.
+    pub fn resolve_key(&self, name: &str, selection: Selection<'_>) -> Result<EntryKey> {
+        let candidates = self.store.find_all_named(name);
+        if candidates.is_empty() {
+            bail!("no entry named '{name}'");
+        }
+        match selection {
+            Selection::In("global") => {
+                pick(&candidates, None).ok_or_else(|| anyhow!("no global entry named '{name}'"))
+            }
+            Selection::In(id) => pick(&candidates, Some(id))
+                .ok_or_else(|| anyhow!("no entry named '{name}' in scope '{id}'")),
+            Selection::CurrentScope => {
+                for scope in self.scopes.active(&self.cwd).iter().rev() {
+                    if let Some(key) = pick(&candidates, Some(&scope.id)) {
+                        return Ok(key);
+                    }
+                }
+                bail!("no scope in this directory has an entry named '{name}'")
+            }
+            Selection::Auto => {
+                for scope in self.scopes.active(&self.cwd).iter().rev() {
+                    if let Some(key) = pick(&candidates, Some(&scope.id)) {
+                        return Ok(key);
+                    }
+                }
+                if let Some(key) = pick(&candidates, None) {
+                    return Ok(key);
+                }
+                if candidates.len() == 1 {
+                    return Ok(EntryKey::of(candidates[0]));
+                }
+                let list = candidates
+                    .iter()
+                    .map(|e| EntryKey::of(e).label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("'{name}' is ambiguous: {list}. Choose one with --in <id|global>")
+            }
+        }
+    }
+
     /// Add an entry at the requested placement and persist, returning the key
     /// it landed under. The only place a scope is created: the store accepts
     /// the entry first, so a rejected entry leaves no scope behind.
@@ -277,6 +333,14 @@ impl App {
         }
         self.update(key, entry)
     }
+}
+
+/// The candidate living in `scope`, where `None` means global.
+fn pick(candidates: &[&Entry], scope: Option<&str>) -> Option<EntryKey> {
+    candidates
+        .iter()
+        .find(|e| e.scope.as_deref() == scope)
+        .map(|e| EntryKey::of(e))
 }
 
 /// The working directory as the shell names it. Shells keep `PWD` logical
@@ -460,6 +524,127 @@ mod tests {
 
         assert_eq!(key, EntryKey::global("ll"));
         assert!(app.scopes.is_empty());
+    }
+
+    #[test]
+    fn auto_selection_prefers_the_deepest_active_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("work");
+        let inner = outer.join("api");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mut app = test_app(&dir);
+        app.add(
+            Entry::new("x", Kind::Alias, "global", "d"),
+            &Placement::Global,
+        )
+        .unwrap();
+        app = app.with_cwd(outer.canonicalize().unwrap());
+        app.add(Entry::new("x", Kind::Alias, "outer", "d"), &Placement::Here)
+            .unwrap();
+        app = app.with_cwd(inner.canonicalize().unwrap());
+        app.add(Entry::new("x", Kind::Alias, "inner", "d"), &Placement::Here)
+            .unwrap();
+
+        assert_eq!(
+            app.resolve_key("x", Selection::Auto)
+                .unwrap()
+                .scope
+                .as_deref(),
+            Some("api")
+        );
+
+        let app = app.with_cwd(outer.canonicalize().unwrap());
+        assert_eq!(
+            app.resolve_key("x", Selection::Auto)
+                .unwrap()
+                .scope
+                .as_deref(),
+            Some("work")
+        );
+
+        let app = app.with_cwd(dir.path().canonicalize().unwrap());
+        assert_eq!(app.resolve_key("x", Selection::Auto).unwrap().scope, None);
+    }
+
+    #[test]
+    fn auto_selection_takes_a_single_inactive_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir).with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("dep", Kind::Alias, "deploy", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        let app = app.with_cwd(dir.path().canonicalize().unwrap());
+        assert_eq!(
+            app.resolve_key("dep", Selection::Auto)
+                .unwrap()
+                .scope
+                .as_deref(),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn auto_selection_fails_and_lists_candidates_when_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("work/a");
+        let b = dir.path().join("work/b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut app = test_app(&dir).with_cwd(a.canonicalize().unwrap());
+        app.add(Entry::new("dep", Kind::Alias, "a", "d"), &Placement::Here)
+            .unwrap();
+        let mut app = app.with_cwd(b.canonicalize().unwrap());
+        app.add(Entry::new("dep", Kind::Alias, "b", "d"), &Placement::Here)
+            .unwrap();
+
+        let app = app.with_cwd(dir.path().canonicalize().unwrap());
+        let err = app
+            .resolve_key("dep", Selection::Auto)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--in"), "err was: {err}");
+        assert!(
+            err.contains("dep (a)") && err.contains("dep (b)"),
+            "err was: {err}"
+        );
+    }
+
+    #[test]
+    fn current_scope_selection_does_not_fall_back_to_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir).with_cwd(dir.path().canonicalize().unwrap());
+        app.add(
+            Entry::new("x", Kind::Alias, "global", "d"),
+            &Placement::Global,
+        )
+        .unwrap();
+        let err = app
+            .resolve_key("x", Selection::CurrentScope)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no scope"), "err was: {err}");
+    }
+
+    #[test]
+    fn in_selects_an_entry_in_an_unknown_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let mut store = Store::default();
+        let mut entry = Entry::new("ghost", Kind::Alias, "boo", "d");
+        entry.scope = Some("gone".into());
+        store.add(entry).unwrap();
+        let app = App::with(paths, Config::default(), store);
+
+        let key = app.resolve_key("ghost", Selection::In("gone")).unwrap();
+        assert_eq!(key.scope.as_deref(), Some("gone"));
+        assert!(app.resolve_key("ghost", Selection::In("global")).is_err());
+        assert!(app.resolve_key("nothing", Selection::Auto).is_err());
     }
 
     #[test]

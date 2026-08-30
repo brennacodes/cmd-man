@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
-use crate::app::{App, now_timestamp};
+use crate::app::{App, Selection, now_timestamp};
 use crate::backup;
 use crate::capture;
 use crate::model::{Entry, EntryKey, Kind};
@@ -46,13 +46,19 @@ enum Command {
     /// Edit fields of an existing entry.
     Edit(EditArgs),
     /// Remove an entry.
-    Rm { name: String },
+    Rm {
+        name: String,
+        #[command(flatten)]
+        selection: SelectionArgs,
+    },
     /// Capture example output for an entry.
     Capture {
         name: String,
         /// Skip the confirmation prompt for flagged commands.
         #[arg(long)]
         yes: bool,
+        #[command(flatten)]
+        selection: SelectionArgs,
     },
     /// Import currently active shell aliases and functions.
     Import {
@@ -104,6 +110,28 @@ struct AddArgs {
     global: bool,
 }
 
+/// Which entry a command means when a name exists in more than one place.
+#[derive(Args)]
+#[command(group = ArgGroup::new("selection").multiple(false))]
+struct SelectionArgs {
+    /// Act on the entry in this scope id, or `global` for the unscoped one.
+    #[arg(long = "in", value_name = "ID", group = "selection")]
+    in_scope: Option<String>,
+    /// Act only on an entry in a scope covering this directory.
+    #[arg(long, group = "selection")]
+    current_scope: bool,
+}
+
+impl SelectionArgs {
+    fn selection(&self) -> Selection<'_> {
+        match (&self.in_scope, self.current_scope) {
+            (Some(id), _) => Selection::In(id),
+            (None, true) => Selection::CurrentScope,
+            (None, false) => Selection::Auto,
+        }
+    }
+}
+
 #[derive(Args)]
 struct EditArgs {
     name: String,
@@ -125,6 +153,8 @@ struct EditArgs {
     /// Do not auto-fill empty description/usage/options/examples from --help.
     #[arg(long)]
     no_help: bool,
+    #[command(flatten)]
+    selection: SelectionArgs,
 }
 
 /// Parse arguments and run the requested command (or the TUI).
@@ -159,8 +189,12 @@ fn dispatch(cmd: Command) -> Result<()> {
         Command::Search { query } => cmd_search(&query.join(" ")),
         Command::List { category, kind } => cmd_list(category, kind),
         Command::Edit(args) => cmd_edit(args),
-        Command::Rm { name } => cmd_rm(&name),
-        Command::Capture { name, yes } => cmd_capture(&name, yes),
+        Command::Rm { name, selection } => cmd_rm(&name, &selection),
+        Command::Capture {
+            name,
+            yes,
+            selection,
+        } => cmd_capture(&name, yes, &selection),
         Command::Import { yes } => cmd_import(yes),
         Command::Init => cmd_init(),
         Command::Reload => cmd_reload(),
@@ -340,7 +374,7 @@ fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
 
 fn cmd_edit(args: EditArgs) -> Result<()> {
     let mut app = load_app()?;
-    let key = EntryKey::global(&args.name);
+    let key = app.resolve_key(&args.name, args.selection.selection())?;
     let mut entry = app
         .store
         .find(&key)
@@ -379,18 +413,19 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_rm(name: &str) -> Result<()> {
+fn cmd_rm(name: &str, selection: &SelectionArgs) -> Result<()> {
     let mut app = load_app()?;
-    let key = EntryKey::global(name);
+    let key = app.resolve_key(name, selection.selection())?;
     app.remove(&key)?;
     println!("Removed '{}'.", key.label());
     print_reload_hint(&app);
     Ok(())
 }
 
-fn cmd_capture(name: &str, yes: bool) -> Result<()> {
+fn cmd_capture(name: &str, yes: bool, selection: &SelectionArgs) -> Result<()> {
     let mut app = load_app()?;
-    do_capture(&mut app, &EntryKey::global(name), yes)
+    let key = app.resolve_key(name, selection.selection())?;
+    do_capture(&mut app, &key, yes)
 }
 
 fn do_capture(app: &mut App, key: &EntryKey, yes: bool) -> Result<()> {

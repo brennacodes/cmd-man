@@ -59,8 +59,8 @@ fn run_shell(shell: &str, file: &Path, script: &str) -> String {
 
 /// A throwaway `$HOME` holding a cmd-man store.
 ///
-/// Entries and scopes are seeded through the library because the CLI flags that
-/// place an entry in a scope (`--here`, `--in`) do not exist yet. The shell
+/// Entries and scopes are seeded through the library so each case can state the
+/// exact store it needs without going through placement resolution. The shell
 /// files are still produced by the real binary, via `cmd-man reload`, so the
 /// generation path under test is the shipped one.
 struct Fixture {
@@ -125,7 +125,12 @@ impl Fixture {
         id
     }
 
+    /// Remove an entry with the real binary, naming its scope with `--in`, and
+    /// keep the fixture's own store in step. The binary regenerates the shell
+    /// files itself, so no `generate` call is needed afterwards.
     fn remove(&mut self, key: &EntryKey) {
+        let scope = key.scope.as_deref().unwrap_or("global");
+        self.run(&["rm", key.name.as_str(), "--in", scope]);
         self.store.remove(key).unwrap();
     }
 
@@ -133,12 +138,17 @@ impl Fixture {
     fn generate(&self) {
         self.store.save(&self.paths).unwrap();
         self.scopes.save(&self.paths).unwrap();
+        self.run(&["reload"]);
+    }
+
+    /// Run the real binary against the fixture's home and store.
+    fn run(&self, args: &[&str]) {
         Command::cargo_bin("cmd-man")
             .unwrap()
             .env("HOME", &self.home)
             .env("CMD_MAN_HOME", self.paths.root())
             .env("CMD_MAN_DISABLE_SYNC", "1")
-            .arg("reload")
+            .args(args)
             .assert()
             .success();
     }
@@ -358,7 +368,6 @@ fn zsh_delete_then_regenerate_then_resource_clears_the_removed_name() {
         scope: Some(scope),
         name: "gone".into(),
     });
-    fx.generate();
 
     let file = fx.file("zsh");
     let out = run_shell(

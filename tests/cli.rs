@@ -495,3 +495,78 @@ fn a_directory_named_here_never_takes_the_here_keyword() {
         .success()
         .stdout(predicate::str::contains("scoped to here-2"));
 }
+
+#[test]
+fn rm_inside_a_scope_removes_the_scoped_entry_and_says_so() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd(&home)
+        .args(["add", "dep", "-c", "echo global", "--desc", "g"])
+        .assert()
+        .success();
+    cmd_in(&home, &api)
+        .args(["add", "dep", "-c", "echo scoped", "--desc", "s", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, &api)
+        .args(["rm", "dep"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dep (api)"));
+
+    // The global entry of the same name is untouched.
+    cmd(&home)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echo global"))
+        .stdout(predicate::str::contains("echo scoped").not());
+}
+
+#[test]
+fn in_global_selects_the_global_entry_from_inside_a_scope() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd(&home)
+        .args(["add", "dep", "-c", "echo global", "--desc", "g"])
+        .assert()
+        .success();
+    cmd_in(&home, &api)
+        .args(["add", "dep", "-c", "echo scoped", "--desc", "s", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, &api)
+        .args([
+            "edit",
+            "dep",
+            "--in",
+            "global",
+            "--desc",
+            "edited",
+            "--no-help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updated 'dep'"));
+
+    let toml = std::fs::read_to_string(store_dir(&home).join("categories/general.toml")).unwrap();
+    assert!(toml.contains("edited"), "store was: {toml}");
+}
+
+#[test]
+fn current_scope_fails_outside_a_scope() {
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["add", "dep", "-c", "echo g", "--desc", "g"])
+        .assert()
+        .success();
+    cmd_in(&home, home.path())
+        .args(["rm", "dep", "--current-scope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no scope"));
+}
