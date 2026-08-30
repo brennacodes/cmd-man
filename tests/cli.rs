@@ -222,3 +222,30 @@ fn function_kind_generates_function_definition() {
     let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
     assert!(zsh.contains("function hi {"), "zsh was: {zsh}");
 }
+
+#[test]
+fn an_entry_in_an_unknown_scope_warns_and_is_not_rendered() {
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["add", "ok", "-c", "echo ok", "--desc", "d"])
+        .assert()
+        .success();
+
+    let file = store_dir(&home).join("categories/general.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("name = \"ok\"", "name = \"ok\"\nscope = \"ghost\""),
+    )
+    .unwrap();
+
+    cmd(&home)
+        .args(["list"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("ghost"));
+
+    cmd(&home).args(["reload"]).assert().success();
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(!zsh.contains("echo ok"), "zsh was: {zsh}");
+}

@@ -37,14 +37,48 @@ impl App {
         let config = Config::load(&paths)?;
         let store = Store::load(&paths)?;
         let scopes = ScopeRegistry::load(&paths)?;
-        Ok(App {
+        let app = App {
             paths,
             config,
             store,
             scopes,
             cwd: process_cwd(),
             notices: Vec::new(),
-        })
+        };
+        Ok(app.finish_load())
+    }
+
+    /// Collect the non-fatal problems in the state just loaded. A bad scope
+    /// registry, an unknown `scope.default`, and an entry pointing at a scope
+    /// that no longer exists are all reachable from a hand edit or a sync
+    /// merge, and none of them may make the store unloadable.
+    fn finish_load(mut self) -> Self {
+        self.notices.extend(self.scopes.issues().iter().cloned());
+        if let (_, Some(notice)) = self.config.scope.resolve() {
+            self.notices.push(notice);
+        }
+        let mut unknown: Vec<String> = self
+            .store
+            .entries()
+            .iter()
+            .filter_map(|e| e.scope.as_ref())
+            .filter(|id| self.scopes.find(id).is_none())
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown.dedup();
+        for id in unknown {
+            self.notices.push(format!(
+                "entries reference unknown scope '{id}'; they are inactive until you \
+                 re-create that scope or move them out of it"
+            ));
+        }
+        self
+    }
+
+    /// Non-fatal problems found while loading. Printed once by the CLI.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     /// Construct from explicit parts (used in tests).
@@ -236,5 +270,72 @@ mod tests {
         assert_eq!(e.example_output, "Switched to branch 'main'");
         assert!(e.destructive);
         assert_eq!(e.capture_policy, CapturePolicy::Confirm);
+    }
+
+    #[test]
+    fn an_unknown_scope_id_is_a_notice_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.categories_dir().join("general.toml"),
+            "[[entry]]\nname = \"ll\"\nscope = \"gone\"\nkind = \"alias\"\ncommand = \"ls\"\n\
+             description = \"d\"\ncategory = \"general\"\ncreated_at = \"t\"\nupdated_at = \"t\"\n",
+        )
+        .unwrap();
+
+        let store = Store::load(&paths).unwrap();
+        let app = App::with(paths, Config::default(), store).finish_load();
+
+        assert_eq!(app.store.entries().len(), 1);
+        assert!(
+            app.notices().iter().any(|n| n.contains("gone")),
+            "notices were: {:?}",
+            app.notices()
+        );
+    }
+
+    #[test]
+    fn an_unknown_scope_default_is_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        let mut config = Config::default();
+        config.scope.default = "nonsense".into();
+
+        let app = App::with(paths, config, Store::default()).finish_load();
+
+        assert!(
+            app.notices().iter().any(|n| n.contains("nonsense")),
+            "notices were: {:?}",
+            app.notices()
+        );
+    }
+
+    #[test]
+    fn registry_issues_become_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        let scopes = ScopeRegistry::from_scopes(vec![
+            crate::scopes::Scope {
+                id: "api".into(),
+                path: "~/work/api".into(),
+                created_at: "t".into(),
+            },
+            crate::scopes::Scope {
+                id: "api".into(),
+                path: "~/other/api".into(),
+                created_at: "t".into(),
+            },
+        ]);
+
+        let app = App::with(paths, Config::default(), Store::default())
+            .with_scopes(scopes)
+            .finish_load();
+
+        assert!(
+            app.notices().iter().any(|n| n.contains("duplicate scope")),
+            "notices were: {:?}",
+            app.notices()
+        );
     }
 }

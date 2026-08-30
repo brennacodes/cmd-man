@@ -158,6 +158,15 @@ fn dispatch(cmd: Command) -> Result<()> {
     }
 }
 
+/// Load state and report anything non-fatal that was found on the way.
+fn load_app() -> Result<App> {
+    let app = App::load()?;
+    for notice in app.notices() {
+        eprintln!("cmd-man: {notice}");
+    }
+    Ok(app)
+}
+
 fn parse_kind(raw: Option<String>) -> Result<Kind> {
     match raw {
         None => Ok(Kind::Alias),
@@ -166,7 +175,7 @@ fn parse_kind(raw: Option<String>) -> Result<Kind> {
 }
 
 fn cmd_add(args: AddArgs) -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = load_app()?;
     let kind = parse_kind(args.kind)?;
 
     let command = match args.command {
@@ -206,7 +215,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
 }
 
 fn cmd_new() -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = load_app()?;
     let name = prompt_required("Alias")?;
     let kind = loop {
         let raw = prompt("Kind [alias/function] (alias)");
@@ -247,7 +256,7 @@ fn cmd_new() -> Result<()> {
 }
 
 fn cmd_search(query: &str) -> Result<()> {
-    let app = App::load()?;
+    let app = load_app()?;
     let results = app.search(query, &Filter::default());
     if results.is_empty() {
         println!("No matches.");
@@ -263,7 +272,7 @@ fn cmd_search(query: &str) -> Result<()> {
 }
 
 fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
-    let app = App::load()?;
+    let app = load_app()?;
     let filter = Filter {
         category: category.map(|c| crate::store::normalize_category(&c)),
         kind: match kind {
@@ -288,7 +297,7 @@ fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
 }
 
 fn cmd_edit(args: EditArgs) -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = load_app()?;
     let key = EntryKey::global(&args.name);
     let mut entry = app
         .store
@@ -329,7 +338,7 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
 }
 
 fn cmd_rm(name: &str) -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = load_app()?;
     let key = EntryKey::global(name);
     app.remove(&key)?;
     println!("Removed '{}'.", key.label());
@@ -338,7 +347,7 @@ fn cmd_rm(name: &str) -> Result<()> {
 }
 
 fn cmd_capture(name: &str, yes: bool) -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = load_app()?;
     do_capture(&mut app, name, yes)
 }
 
@@ -392,7 +401,7 @@ fn do_capture(app: &mut App, name: &str, yes: bool) -> Result<()> {
 }
 
 fn cmd_import(yes: bool) -> Result<()> {
-    let mut app = App::load()?;
+    let mut app = load_app()?;
     let shell = detect_user_shell();
     println!(
         "Scanning active {} aliases and functions...",
@@ -439,7 +448,7 @@ fn cmd_import(yes: bool) -> Result<()> {
 }
 
 fn cmd_init() -> Result<()> {
-    let app = App::load()?;
+    let app = load_app()?;
     app.regenerate_shells()?;
     let report = shell::install_rc(&app.paths, app.config.shells.zsh, app.config.shells.bash)?;
     if report.touched.is_empty() {
@@ -454,7 +463,7 @@ fn cmd_init() -> Result<()> {
 }
 
 fn cmd_reload() -> Result<()> {
-    let app = App::load()?;
+    let app = load_app()?;
     app.regenerate_shells()?;
     println!("Regenerated shell files.");
     print_reload_hint(&app);
@@ -462,7 +471,7 @@ fn cmd_reload() -> Result<()> {
 }
 
 fn cmd_backup() -> Result<()> {
-    let app = App::load()?;
+    let app = load_app()?;
     let report = backup::run_backup(&app.paths, &app.config, &now_timestamp())?;
     for msg in &report.messages {
         println!("{msg}");
@@ -479,13 +488,13 @@ fn cmd_backup() -> Result<()> {
 }
 
 fn cmd_restore() -> Result<()> {
-    let app = App::load()?;
+    let app = load_app()?;
     let messages = backup::run_restore(&app.paths, &app.config)?;
     for msg in &messages {
         println!("{msg}");
     }
     // Regenerate shell files from the restored store.
-    let app = App::load()?;
+    let app = load_app()?;
     app.regenerate_shells()?;
     println!("Restored store and regenerated shell files.");
     print_reload_hint(&app);
