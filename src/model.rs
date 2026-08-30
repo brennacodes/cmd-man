@@ -186,7 +186,13 @@ impl Entry {
         Ok(())
     }
 
-    /// A single-line haystack used for fuzzy searching.
+    /// Every searchable field joined into one string; `usage`, `options`,
+    /// `examples` and `example_output` are deliberately left out. A
+    /// `Kind::Function` command is embedded verbatim, so this is not one line.
+    ///
+    /// `search` matches this literally rather than as a subsequence, precisely
+    /// because it carries that body: a subsequence over it is satisfied by
+    /// letters drawn from unrelated words.
     pub fn search_haystack(&self) -> String {
         format!(
             "{} {} {} {} {} {}",

@@ -83,7 +83,7 @@ fn add_generates_live_alias_and_lists_it() {
 }
 
 #[test]
-fn search_finds_by_fuzzy_query() {
+fn search_matches_a_name_as_a_subsequence_and_a_description_by_whole_word() {
     let home = TempDir::new().unwrap();
     cmd(&home)
         .args(["add", "gitsw", "-c", "git switch", "--desc", "switch"])
@@ -94,6 +94,15 @@ fn search_finds_by_fuzzy_query() {
         .assert()
         .success();
 
+    // A subsequence of the name, and not a substring of anything.
+    cmd(&home)
+        .args(["search", "gtsw"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gitsw"))
+        .stdout(predicate::str::contains("clr").not());
+
+    // A whole word of the description.
     cmd(&home)
         .args(["search", "switch"])
         .assert()
