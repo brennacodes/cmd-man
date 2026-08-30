@@ -152,6 +152,16 @@ impl App {
         )
     }
 
+    /// The registered scope ids for an error message, or `none` when empty.
+    pub fn scope_ids_label(&self) -> String {
+        let mut ids: Vec<&str> = self.scopes.scopes().iter().map(|s| s.id.as_str()).collect();
+        if ids.is_empty() {
+            return "none".to_string();
+        }
+        ids.sort_unstable();
+        ids.join(", ")
+    }
+
     /// How a resolved key reads to the user: `global`, or the scope id
     /// followed by its directory.
     pub fn placement_label(&self, key: &EntryKey) -> String {

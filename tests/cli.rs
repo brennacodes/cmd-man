@@ -442,6 +442,27 @@ fn new_prompts_for_placement() {
 }
 
 #[test]
+fn new_reprompts_for_an_unknown_scope_instead_of_discarding_the_answers() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, &api)
+        .args(["add", "ll", "-c", "ls -lah", "--desc", "d", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, &api)
+        .args(["new"])
+        .write_stdin("dep\nalias\necho deploy\ndeploy it\ngeneral\n\n\napx\napi\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unknown scope 'apx'"))
+        .stdout(predicate::str::contains("Known scopes: api"))
+        .stdout(predicate::str::contains("Added 'dep' scoped to api"));
+}
+
+#[test]
 fn a_directory_named_here_never_takes_the_here_keyword() {
     let home = TempDir::new().unwrap();
     let here = home.path().join("here");

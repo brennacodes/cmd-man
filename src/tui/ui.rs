@@ -298,14 +298,9 @@ fn draw_form(frame: &mut Frame, form: &Form) {
                 focus_style,
             )]));
         } else {
-            let value_style = if field.readonly {
-                label_style()
-            } else {
-                Style::default()
-            };
             lines.push(Line::from(vec![
                 Span::styled(label, label_style()),
-                Span::styled(value, value_style),
+                Span::raw(value),
             ]));
         }
     }
@@ -560,13 +555,14 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_scope_is_still_rendered() {
+    fn an_edit_form_renders_the_current_scope() {
         let mut entry = Entry::new("ll", Kind::Alias, "ls -lah", "d");
         entry.scope = Some("api".into());
         let rows = render_form(&Form::edit(&entry), 80, 24);
         assert!(
-            rows.iter().any(|row| row.contains("Scope (read only)")),
-            "no read only scope row in:\n{}",
+            rows.iter()
+                .any(|row| row.contains("Scope (global/here/<id>)") && row.contains("api")),
+            "no scope row in:\n{}",
             rows.join("\n")
         );
     }

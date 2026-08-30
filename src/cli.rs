@@ -266,7 +266,13 @@ fn cmd_new() -> Result<()> {
     let category = prompt("Category (general)");
     let tags = prompt("Tags (comma separated)");
     let usage = prompt("Usage (optional)");
-    let placement = Placement::parse(&prompt("Scope [global/here/<id>] (default)"));
+    let placement = loop {
+        let candidate = Placement::parse(&prompt("Scope [global/here/<id>] (default)"));
+        match app.resolve_target(&candidate) {
+            Ok(_) => break candidate,
+            Err(e) => println!("{e}. Known scopes: {}", app.scope_ids_label()),
+        }
+    };
 
     let mut entry = Entry::new(&name, kind, command, description);
     if !category.trim().is_empty() {

@@ -8,8 +8,6 @@ pub struct Field {
     pub label: &'static str,
     pub value: String,
     pub required: bool,
-    /// Shown for context but neither focusable nor editable.
-    pub readonly: bool,
 }
 
 /// A multi-field form for creating or editing an entry.
@@ -44,61 +42,51 @@ impl Form {
                 label: "Alias (trigger, no spaces)",
                 value: String::new(),
                 required: true,
-                readonly: false,
             },
             Field {
                 label: "Kind (alias/function)",
                 value: "alias".into(),
                 required: true,
-                readonly: false,
             },
             Field {
                 label: "Command / body",
                 value: String::new(),
                 required: true,
-                readonly: false,
             },
             Field {
                 label: "Description",
                 value: String::new(),
                 required: true,
-                readonly: false,
             },
             Field {
                 label: "Category",
                 value: "general".into(),
                 required: false,
-                readonly: false,
             },
             Field {
                 label: "Tags (comma separated)",
                 value: String::new(),
                 required: false,
-                readonly: false,
             },
             Field {
                 label: "Usage",
                 value: String::new(),
                 required: false,
-                readonly: false,
             },
             Field {
                 label: "Options",
                 value: String::new(),
                 required: false,
-                readonly: false,
             },
             Field {
                 label: "Examples",
                 value: String::new(),
                 required: false,
-                readonly: false,
             },
             Field {
                 label: "Scope (global/here/<id>)",
                 value: String::new(),
                 required: false,
-                readonly: false,
             },
         ]
     }
@@ -127,10 +115,7 @@ impl Form {
         fields[USAGE].value = entry.usage.clone();
         fields[OPTIONS].value = entry.options.clone();
         fields[EXAMPLES].value = entry.examples.clone();
-        // An edit never moves an entry, so the scope is shown, not offered.
         fields[SCOPE].value = entry.scope.clone().unwrap_or_else(|| "global".into());
-        fields[SCOPE].label = "Scope (read only)";
-        fields[SCOPE].readonly = true;
         Form {
             title: format!("Edit {}", entry.name),
             original: Some(EntryKey::of(entry)),
@@ -142,42 +127,23 @@ impl Form {
     }
 
     pub fn focus_next(&mut self) {
-        self.step_focus(true);
+        self.focus = (self.focus + 1) % self.fields.len();
     }
 
     pub fn focus_prev(&mut self) {
-        self.step_focus(false);
-    }
-
-    /// Move the focus to the next editable field in either direction, leaving
-    /// it alone when every field is read only.
-    fn step_focus(&mut self, forward: bool) {
-        let len = self.fields.len();
-        for step in 1..=len {
-            let idx = if forward {
-                (self.focus + step) % len
-            } else {
-                (self.focus + len - step) % len
-            };
-            if !self.fields[idx].readonly {
-                self.focus = idx;
-                return;
-            }
-        }
+        self.focus = if self.focus == 0 {
+            self.fields.len() - 1
+        } else {
+            self.focus - 1
+        };
     }
 
     pub fn input(&mut self, c: char) {
-        if self.fields[self.focus].readonly {
-            return;
-        }
         self.error = None;
         self.fields[self.focus].value.push(c);
     }
 
     pub fn backspace(&mut self) {
-        if self.fields[self.focus].readonly {
-            return;
-        }
         self.error = None;
         self.fields[self.focus].value.pop();
     }
@@ -335,22 +301,23 @@ mod tests {
     }
 
     #[test]
-    fn the_edit_form_shows_the_scope_without_offering_to_change_it() {
+    fn the_edit_form_lets_the_scope_be_changed() {
         let mut entry = Entry::new("ll", Kind::Alias, "ls -lah", "d");
         entry.scope = Some("api".into());
         let mut form = Form::edit(&entry);
-        assert!(form.fields[SCOPE].readonly);
 
         form.focus = EXAMPLES;
         form.focus_next();
-        assert_eq!(form.focus, NAME, "focus must skip the read only scope");
-        form.focus_prev();
-        assert_eq!(form.focus, EXAMPLES);
+        assert_eq!(form.focus, SCOPE, "scope must be reachable by focus");
 
-        form.focus = SCOPE;
-        form.input('x');
-        form.backspace();
-        assert_eq!(form.fields[SCOPE].value, "api");
+        for _ in 0..3 {
+            form.backspace();
+        }
+        for c in "web".chars() {
+            form.input(c);
+        }
+        assert_eq!(form.fields[SCOPE].value, "web");
+        assert_eq!(form.placement(), Placement::Scope("web".into()));
     }
 
     #[test]
