@@ -66,7 +66,7 @@ pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String
         "# Regenerate with: cmd-man reload ({})\n\n",
         shell.as_str()
     ));
-    out.push_str(&render_preamble(&managed_names(entries, scopes)));
+    out.push_str(&render_preamble(shell, &managed_names(entries, scopes)));
 
     for entry in &globals {
         out.push_str(&render_entry(entry, ""));
@@ -254,10 +254,15 @@ fi
 /// `PROMPT_COMMAND` is a string, not an array: macOS ships bash 3.2, which has
 /// no array form. cmd-man appends rather than prepends so it cannot corrupt a
 /// prompt the user's own hook is building.
+///
+/// The separator is a newline, not a `;`. A hook that already ends in `;` or in
+/// whitespace is common, and `;` would join it into `mine;;_cmdman_apply`, a
+/// syntax error bash reports at every prompt while running none of it. A
+/// newline joins cleanly in every case, and `:+` keeps an empty hook from
+/// producing a leading blank line.
 const BASH_HOOK: &str = r#"case "${PROMPT_COMMAND-}" in
   *_cmdman_apply*) ;;
-  "") PROMPT_COMMAND="_cmdman_apply" ;;
-  *) PROMPT_COMMAND="$PROMPT_COMMAND;_cmdman_apply" ;;
+  *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}_cmdman_apply" ;;
 esac
 
 "#;
@@ -297,11 +302,31 @@ fn managed_names(entries: &[Entry], scopes: &ScopeRegistry) -> Vec<String> {
 
 /// Clear both namespaces for every managed name so a re-source starts from a
 /// known state, whichever kind each name was defined as last time.
-fn render_preamble(names: &[String]) -> String {
+///
+/// The leading loop clears the names recorded by whichever generation of the
+/// file this shell sourced last, which is the only way a deleted name can go
+/// away: the regenerated file no longer mentions it, so nothing else here would
+/// name it. The current set is then recorded in `_cmdman_names` for the next
+/// re-source. zsh does not word-split an unquoted parameter, so it needs the
+/// `${=name}` form that bash does not have.
+fn render_preamble(shell: Shell, names: &[String]) -> String {
+    let recorded = match shell {
+        Shell::Zsh => "${=_cmdman_names-}",
+        Shell::Bash => "${_cmdman_names-}",
+    };
     let mut out = String::from("# Clear any previous cmd-man definitions.\n");
+    out.push_str(&format!("for _cmdman_stale in {recorded}; do\n"));
+    out.push_str("  unalias -- \"$_cmdman_stale\" 2>/dev/null\n");
+    out.push_str("  unset -f -- \"$_cmdman_stale\" 2>/dev/null\n");
+    out.push_str("done\n");
+    out.push_str("unset _cmdman_stale\n");
     for name in names {
         out.push_str(&render_clearing(name, ""));
     }
+    out.push_str(&format!(
+        "_cmdman_names={}\n",
+        single_quote(&names.join(" "))
+    ));
     out.push('\n');
     out
 }
@@ -783,6 +808,36 @@ mod tests {
         assert!(
             !preamble.contains("alias ll="),
             "the preamble must not define anything: {preamble}"
+        );
+    }
+
+    #[test]
+    fn preamble_clears_the_names_the_last_generation_recorded() {
+        let entries = vec![alias_entry("ll", "ls -la")];
+        let zsh = render(Shell::Zsh, &entries, &ScopeRegistry::default());
+        let bash = render(Shell::Bash, &entries, &ScopeRegistry::default());
+        assert!(
+            preamble_of(&zsh).contains("for _cmdman_stale in ${=_cmdman_names-}; do"),
+            "zsh needs the splitting form: {zsh}"
+        );
+        assert!(
+            preamble_of(&bash).contains("for _cmdman_stale in ${_cmdman_names-}; do"),
+            "bash has no splitting form: {bash}"
+        );
+        for out in [&zsh, &bash] {
+            assert!(
+                preamble_of(out).contains("_cmdman_names='ll'"),
+                "the current set must be recorded: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn preamble_records_an_empty_set_when_nothing_is_managed() {
+        let out = render(Shell::Zsh, &[], &ScopeRegistry::default());
+        assert!(
+            preamble_of(&out).contains("_cmdman_names=''"),
+            "out was: {out}"
         );
     }
 
