@@ -9,16 +9,16 @@ aliases and functions. Entries you add become real shell definitions, so a store
 
 - Full-screen keyboard TUI: browse categories, page through entries, fuzzy search,
   and filter by kind (alias or function) or category.
-- Live shell integration for zsh and bash. Every change regenerates a file your
-  shell sources, so aliases and functions behave natively.
+- Live shell integration for zsh and bash, so aliases and functions behave natively.
 - Aliases and functions are both first-class, tagged by kind so you can parse your
   catalog by type.
+- Directory scopes: an entry can belong to a project directory, so that project's
+  `deploy` is live only inside it and shadows any global entry of the same name.
 - Categories, descriptions, usage, options, examples, and tags on every entry.
 - Description, usage, options, and examples auto-populate from the command's
   `--help`/`man` output when possible, and are always editable by hand.
-- Safe example-output capture: commands run in a hard-timeboxed, auto-killed
-  process wrapped in a filesystem/network sandbox, and output is sanitized before
-  it is stored.
+- Safe example-output capture: commands run sandboxed and hard-timeboxed, and the
+  output is sanitized before it is stored.
 - Automatic background sync, plus manual backup and restore, to a private GitHub
   `cmd-man-backup` repository.
 
@@ -35,21 +35,21 @@ Install directly from GitHub with Cargo (no clone needed):
 cargo install --git https://github.com/brennacodes/cmd-man.git
 ```
 
-Or build from a local clone (for development):
+Or build from a local clone:
 
 ```sh
 cargo install --path .
 ```
 
-Then wire cmd-man into your shells (adds a small managed block to your rc files and
-generates the definition files):
+Then wire cmd-man into your shells:
 
 ```sh
 cmd-man init
 ```
 
 Open a new shell, or run the `source` command that `init` prints, to load your
-entries into the current shell.
+entries into the current shell. After that, every change takes effect in new
+shells automatically, or in the current one with `cmd-man reload`.
 
 ## Usage
 
@@ -68,6 +68,7 @@ cmd-man
 | `PgUp` / `PgDn` | page through the list |
 | `Tab` | cycle kind filter (all / alias / function) |
 | `g` | cycle category filter |
+| `s` | cycle scope filter (all / live here / one scope) |
 | `a` | add a new entry |
 | `e` | edit the selected entry |
 | `d` | delete the selected entry |
@@ -99,6 +100,23 @@ cmd-man list --kind function
 cmd-man edit gitsw --desc "switch or create branches"
 cmd-man rm gitsw
 
+# Scope an entry to the current project
+cmd-man add dep --command "make deploy" --desc "deploy" --here
+
+# Move an existing entry into a scope, or back out of one
+cmd-man edit dep --move-here
+cmd-man edit dep --make-global
+
+# Work with a specific entry when a name exists more than once
+cmd-man rm dep --in api
+cmd-man list --all
+cmd-man list --in global
+
+# Manage scopes
+cmd-man scope list
+cmd-man scope relocate api ~/work/api
+cmd-man scope rm api --promote-to-global
+
 # Capture example output for an entry
 cmd-man capture <alias>
 
@@ -113,78 +131,83 @@ cmd-man backup
 cmd-man restore
 ```
 
-## How aliases become live
+## Directory-scoped entries
 
-cmd-man stores entries as human-readable TOML, one file per category, under
-`~/.config/cmd-man/categories/`. On every change it regenerates
-`~/.config/cmd-man/shell/cmd-man.zsh` and `cmd-man.bash` containing real `alias`
-and function definitions. `cmd-man init` adds one managed block to your `.zshrc`
-and `.bashrc`/`.bash_profile` that sources the matching file. New shells pick up
-changes automatically; for the current shell, run the `source` command cmd-man
-prints, or `cmd-man reload`.
+A scope is a short id attached to one directory, for example `api` for
+`~/work/api`. An entry placed in a scope is defined only while your shell's
+working directory is inside that directory, and it shadows a global entry of the
+same name while it is live. Leave the directory and the global definition comes
+back. If scopes are nested, the deepest one containing your working directory
+wins.
+
+New entries are global unless you say otherwise. `--here` scopes an entry to the
+enclosing git repository, or to the current directory when there is no repository,
+creating a scope named after that directory the first time. `--scope <id>` places
+it in a scope that already exists, and `--global` forces a global entry. Every add
+tells you where the entry landed:
+
+```sh
+$ cmd-man add dep --command "make deploy" --desc "deploy" --here
+Added 'dep' scoped to api ($HOME/work/api).
+```
+
+`cmd-man scope list` shows every scope, its directory, how many entries it holds,
+and which one you are standing in. `cmd-man list` shows your globals plus the
+entries of the scopes you are inside, so a global and the scoped entry shadowing
+it both appear; `cmd-man list --all` shows every entry, and `cmd-man list --in api`
+or `--in global` shows one scope's worth.
+
+When a name exists in more than one place, `edit`, `rm`, and `capture` pick the
+same entry your shell would run: the innermost scope you are inside, otherwise the
+global one. If neither applies, cmd-man lists the candidates and asks you to choose
+with `--in <id|global>`.
+
+### Known limitations
+
+- A scoped entry is not available on the same line as the `cd` that entered its
+  scope, so `cd ~/work/api && dep` does not work. Use two lines, or `cd` first.
+  In zsh a scoped function is the one exception.
+- On bash, scoped entries are interactive-only and do not work in scripts.
+- A scope matches one exact directory spelling, so reaching the directory through
+  a differently-spelled symlink does not activate it, and on a case-insensitive
+  macOS volume `cd /users/...` does not activate a scope stored as `/Users/...`.
+  `cmd-man scope list` says so when your working directory reaches a scope only
+  once symlinks are resolved.
+- A scope whose directory does not exist on the machine you are on never
+  activates. `cmd-man scope list` marks it `(missing)`, and
+  `cmd-man scope relocate <id> <dir>` points it at the right place.
+- A hand-typed alias of yours that collides with a cmd-man name is cleared when
+  your shell loads cmd-man.
 
 ## Capturing example output
 
-When you capture output, cmd-man first classifies the command. Safe commands run
-automatically. Anything that looks destructive or has outward side effects (for
-example `rm`, `reset`, `push`, or verbs like delete, remove, rename, move, cut) is
-flagged and requires confirmation. The command runs in a dedicated process with a
-hard timeout that is killed when it expires, wrapped in a filesystem/network
-sandbox, and the captured output is sanitized (home paths, usernames, IP
-addresses, emails, and token-shaped strings are redacted) before being stored.
-
-Capture that depends on your local context runs on your machine so it can see your
-real tools and paths; the sandbox restricts writes and blocks network access as a
-safety layer.
+`cmd-man capture <name>` runs an entry and stores its output as an example. Safe
+commands run automatically; anything destructive or with outward side effects (for
+example `rm`, `reset`, `push`) needs confirmation first. Every capture is
+sandboxed, hard-timeboxed, and sanitized, so home paths, usernames, IP addresses,
+emails, and token-shaped strings never reach your store.
 
 ## Auto-filling from help
 
-When you add or edit an entry, cmd-man reads the command's `--help`/`-h` output
-(sandboxed and timeboxed, no pager) and fills any empty description, usage,
-options, or examples fields by parsing the standard help sections. It never
-overwrites text you already entered. In the TUI add/edit form, press `Ctrl-F` to
-fetch on demand and review before saving. Pass `--no-help` to `add`/`edit`, or
-leave the fields populated, to skip the lookup. Commands whose help does not
-follow recognizable sections simply leave the fields blank for you to fill in.
+When you add or edit an entry, cmd-man reads the command's `--help` output and
+fills any empty description, usage, options, or examples fields. It never
+overwrites text you already entered. Press `Ctrl-F` in the TUI form to fetch on
+demand, or pass `--no-help` to `add`/`edit` to skip the lookup.
 
-## Automatic sync
+## Sync and backups
 
-Once a backup remote is reachable, cmd-man keeps your entries synced automatically,
-with no manual step. In a short-lived background process that never blocks you, it
-pulls the latest on every invocation and commits and pushes whenever you add, edit,
-remove, or capture an entry.
+Once a backup remote is reachable, cmd-man keeps your entries synced
+automatically, in the background, without ever blocking you. A remote is reachable
+when `backup.remote_url` is set, when `gh` is installed and authenticated, or when
+a GitHub OAuth token is already stored. On a new machine, the first run clones your
+existing backup and sets up your shell files, so your aliases travel with you.
 
-A remote is reachable when any of these holds, preferred in this order:
+Sync is on by default. Turn it off with `auto_sync = false` under `[backup]` in
+your config, or set `CMD_MAN_DISABLE_SYNC=1` for a single run.
 
-1. `backup.remote_url` is set in your config.
-2. `gh` is installed and authenticated. A private `cmd-man-backup` repository is
-   created for you on the first push.
-3. A GitHub OAuth token is already stored (see Backups below).
-
-On a new machine where the remote is reachable, the first run clones your existing
-backup and regenerates your shell files, so your aliases and functions travel with
-you with zero setup. This clone only happens when your local store is empty, so it
-never overwrites entries you created locally first.
-
-Automatic sync is on by default. Turn it off with `auto_sync = false` under
-`[backup]` in `~/.config/cmd-man/config.toml`, or set `CMD_MAN_DISABLE_SYNC=1` to
-disable it for a single run. If a sync cannot reach the remote, cmd-man prints a
-one-line notice on your next command and retries then; your work is never blocked.
-
-## Backups
-
-`cmd-man backup` commits your categories and config and pushes them to a private
-`cmd-man-backup` repository, choosing the best available method automatically:
-
-1. The GitHub CLI (`gh`) when it is installed and authenticated.
-2. A built-in GitHub OAuth device flow, when a client id is configured via
-   `CMD_MAN_GITHUB_CLIENT_ID` (the token is stored in your OS keychain).
-3. A plain git remote using your existing credentials. If the repository does not
-   exist yet, cmd-man prints a pre-filled link to create it.
-
-You are never forced onto a method: you can disable higher tiers or pick one
-explicitly in `~/.config/cmd-man/config.toml`. `cmd-man restore` pulls the backup
-back down and regenerates your shell files.
+`cmd-man backup` and `cmd-man restore` are the manual equivalents. Both use a
+private `cmd-man-backup` repository and pick the best available method for you;
+you can also choose one explicitly in your config.
 
 ## Configuration
 
