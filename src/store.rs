@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::model::{DEFAULT_CATEGORY, Entry};
+use crate::model::{DEFAULT_CATEGORY, Entry, EntryKey};
 use crate::paths::Paths;
 
 /// On-disk shape of a single category file: `[[entry]]` tables.
@@ -52,8 +52,9 @@ impl Store {
     fn check_unique(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for e in &self.entries {
-            if !seen.insert(e.name.as_str()) {
-                bail!("duplicate entry name '{}' in store", e.name);
+            let key = EntryKey::of(e);
+            if !seen.insert(key.clone()) {
+                bail!("duplicate entry '{}' in store", key.label());
             }
         }
         Ok(())
@@ -71,8 +72,16 @@ impl Store {
         self.entries.len()
     }
 
-    pub fn find(&self, name: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.name == name)
+    /// Look up the single entry with this exact `(scope, name)` pair.
+    pub fn find(&self, key: &EntryKey) -> Option<&Entry> {
+        self.entries
+            .iter()
+            .find(|e| e.name == key.name && e.scope == key.scope)
+    }
+
+    /// Every entry sharing a name, across all scopes.
+    pub fn find_all_named(&self, name: &str) -> Vec<&Entry> {
+        self.entries.iter().filter(|e| e.name == name).collect()
     }
 
     /// Sorted, de-duplicated list of category names in use.
@@ -87,12 +96,14 @@ impl Store {
         cats
     }
 
-    /// Add a new entry, enforcing name uniqueness and stamping timestamps.
+    /// Add a new entry, enforcing `(scope, name)` uniqueness and stamping
+    /// timestamps.
     pub fn add(&mut self, mut entry: Entry) -> Result<()> {
         entry.category = normalize_category(&entry.category);
         entry.validate().map_err(|e| anyhow!(e))?;
-        if self.find(&entry.name).is_some() {
-            bail!("an entry named '{}' already exists", entry.name);
+        let key = EntryKey::of(&entry);
+        if self.find(&key).is_some() {
+            bail!("entry '{}' already exists", key.label());
         }
         let now = now_string();
         if entry.created_at.is_empty() {
@@ -103,32 +114,33 @@ impl Store {
         Ok(())
     }
 
-    /// Replace an existing entry (matched by `name`), preserving `created_at`.
-    pub fn update(&mut self, name: &str, mut entry: Entry) -> Result<()> {
+    /// Replace an existing entry (matched by `key`), preserving `created_at`.
+    pub fn update(&mut self, key: &EntryKey, mut entry: Entry) -> Result<()> {
         entry.category = normalize_category(&entry.category);
         entry.validate().map_err(|e| anyhow!(e))?;
-        // If the name changed, the new name must be free.
-        if entry.name != name && self.find(&entry.name).is_some() {
-            bail!("an entry named '{}' already exists", entry.name);
+        // If the entry moved to a different key, that key must be free.
+        let new_key = EntryKey::of(&entry);
+        if &new_key != key && self.find(&new_key).is_some() {
+            bail!("entry '{}' already exists", new_key.label());
         }
         let idx = self
             .entries
             .iter()
-            .position(|e| e.name == name)
-            .ok_or_else(|| anyhow!("no entry named '{name}'"))?;
+            .position(|e| e.name == key.name && e.scope == key.scope)
+            .ok_or_else(|| anyhow!("no entry '{}'", key.label()))?;
         entry.created_at = self.entries[idx].created_at.clone();
         entry.updated_at = now_string();
         self.entries[idx] = entry;
         Ok(())
     }
 
-    /// Remove an entry by name. Returns the removed entry.
-    pub fn remove(&mut self, name: &str) -> Result<Entry> {
+    /// Remove an entry by key. Returns the removed entry.
+    pub fn remove(&mut self, key: &EntryKey) -> Result<Entry> {
         let idx = self
             .entries
             .iter()
-            .position(|e| e.name == name)
-            .ok_or_else(|| anyhow!("no entry named '{name}'"))?;
+            .position(|e| e.name == key.name && e.scope == key.scope)
+            .ok_or_else(|| anyhow!("no entry '{}'", key.label()))?;
         Ok(self.entries.remove(idx))
     }
 
@@ -165,7 +177,7 @@ impl Store {
         }
 
         for (category, mut entries) in grouped {
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            entries.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
             let file = CategoryFile { entry: entries };
             let text = toml::to_string_pretty(&file)
                 .with_context(|| format!("serializing category '{category}'"))?;
@@ -215,13 +227,23 @@ mod tests {
         (dir, paths)
     }
 
+    fn entry_named(name: &str) -> Entry {
+        Entry::new(name, Kind::Alias, "ls -la", "d")
+    }
+
+    fn scoped_entry(name: &str, scope: &str) -> Entry {
+        let mut entry = entry_named(name);
+        entry.scope = Some(scope.to_string());
+        entry
+    }
+
     #[test]
     fn add_find_and_uniqueness() {
         let mut store = Store::default();
         store
             .add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"))
             .unwrap();
-        assert!(store.find("gitsw").is_some());
+        assert!(store.find(&EntryKey::global("gitsw")).is_some());
         let dup = store.add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"));
         assert!(dup.is_err());
     }
@@ -243,7 +265,10 @@ mod tests {
 
         let reloaded = Store::load(&paths).unwrap();
         assert_eq!(reloaded.len(), 2);
-        assert_eq!(reloaded.find("gitsw").unwrap().category, "git-stuff");
+        assert_eq!(
+            reloaded.find(&EntryKey::global("gitsw")).unwrap().category,
+            "git-stuff"
+        );
     }
 
     #[test]
@@ -256,7 +281,7 @@ mod tests {
         store.save(&paths).unwrap();
         assert!(paths.categories_dir().join("general.toml").exists());
 
-        store.remove("c").unwrap();
+        store.remove(&EntryKey::global("c")).unwrap();
         store.save(&paths).unwrap();
         assert!(!paths.categories_dir().join("general.toml").exists());
     }
@@ -267,14 +292,155 @@ mod tests {
         store
             .add(Entry::new("old", Kind::Alias, "echo hi", "greet"))
             .unwrap();
-        let created = store.find("old").unwrap().created_at.clone();
+        let created = store
+            .find(&EntryKey::global("old"))
+            .unwrap()
+            .created_at
+            .clone();
         let mut renamed = Entry::new("new", Kind::Alias, "echo hi", "greet");
         renamed.description = "greet louder".into();
-        store.update("old", renamed).unwrap();
-        assert!(store.find("old").is_none());
-        let updated = store.find("new").unwrap();
+        store.update(&EntryKey::global("old"), renamed).unwrap();
+        assert!(store.find(&EntryKey::global("old")).is_none());
+        let updated = store.find(&EntryKey::global("new")).unwrap();
         assert_eq!(updated.created_at, created);
         assert_eq!(updated.description, "greet louder");
+    }
+
+    #[test]
+    fn same_name_in_two_scopes_is_allowed() {
+        let mut store = Store::default();
+        store.add(entry_named("ll")).unwrap();
+        store.add(scoped_entry("ll", "api")).unwrap();
+        store.add(scoped_entry("ll", "web")).unwrap();
+        assert!(store.add(scoped_entry("ll", "api")).is_err());
+        assert!(store.add(entry_named("ll")).is_err());
+        assert_eq!(store.entries().len(), 3);
+    }
+
+    #[test]
+    fn lookup_is_keyed_on_scope_and_name() {
+        let mut store = Store::default();
+        store.add(entry_named("ll")).unwrap();
+        store.add(scoped_entry("ll", "api")).unwrap();
+        assert_eq!(store.find(&EntryKey::global("ll")).unwrap().scope, None);
+        assert_eq!(
+            store
+                .find(&EntryKey {
+                    scope: Some("api".into()),
+                    name: "ll".into()
+                })
+                .unwrap()
+                .scope,
+            Some("api".to_string())
+        );
+        assert!(
+            store
+                .find(&EntryKey {
+                    scope: Some("gone".into()),
+                    name: "ll".into()
+                })
+                .is_none()
+        );
+        assert_eq!(store.find_all_named("ll").len(), 2);
+    }
+
+    #[test]
+    fn update_rejects_a_rename_onto_an_existing_pair() {
+        let mut store = Store::default();
+        store.add(scoped_entry("a", "api")).unwrap();
+        store.add(scoped_entry("b", "api")).unwrap();
+        let mut renamed = scoped_entry("a", "api");
+        renamed.name = "b".into();
+        assert!(
+            store
+                .update(
+                    &EntryKey {
+                        scope: Some("api".into()),
+                        name: "a".into()
+                    },
+                    renamed
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn update_allows_a_rename_that_collides_only_in_another_scope() {
+        let mut store = Store::default();
+        store.add(scoped_entry("a", "api")).unwrap();
+        store.add(entry_named("b")).unwrap();
+        let mut renamed = scoped_entry("a", "api");
+        renamed.name = "b".into();
+        store
+            .update(
+                &EntryKey {
+                    scope: Some("api".into()),
+                    name: "a".into(),
+                },
+                renamed,
+            )
+            .unwrap();
+        assert!(store.find(&EntryKey::global("b")).is_some());
+        assert!(
+            store
+                .find(&EntryKey {
+                    scope: Some("api".into()),
+                    name: "b".into()
+                })
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn update_targets_only_the_keyed_scope() {
+        let mut store = Store::default();
+        store.add(entry_named("ll")).unwrap();
+        store.add(scoped_entry("ll", "api")).unwrap();
+        let mut changed = scoped_entry("ll", "api");
+        changed.command = "ls -lah".into();
+        store
+            .update(
+                &EntryKey {
+                    scope: Some("api".into()),
+                    name: "ll".into(),
+                },
+                changed,
+            )
+            .unwrap();
+        assert_eq!(
+            store.find(&EntryKey::global("ll")).unwrap().command,
+            "ls -la"
+        );
+        assert_eq!(
+            store
+                .find(&EntryKey {
+                    scope: Some("api".into()),
+                    name: "ll".into()
+                })
+                .unwrap()
+                .command,
+            "ls -lah"
+        );
+    }
+
+    #[test]
+    fn remove_only_removes_the_named_pair() {
+        let mut store = Store::default();
+        store.add(entry_named("ll")).unwrap();
+        store.add(scoped_entry("ll", "api")).unwrap();
+        store
+            .remove(&EntryKey {
+                scope: Some("api".into()),
+                name: "ll".into(),
+            })
+            .unwrap();
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].scope, None);
+
+        store.add(scoped_entry("ll", "api")).unwrap();
+        store.remove(&EntryKey::global("ll")).unwrap();
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].scope, Some("api".to_string()));
     }
 
     #[test]

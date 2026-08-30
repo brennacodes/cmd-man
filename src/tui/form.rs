@@ -1,6 +1,6 @@
 //! The add/edit form model used by the TUI.
 
-use crate::model::{Entry, Kind};
+use crate::model::{Entry, EntryKey, Kind};
 
 /// One editable field.
 pub struct Field {
@@ -12,8 +12,8 @@ pub struct Field {
 /// A multi-field form for creating or editing an entry.
 pub struct Form {
     pub title: String,
-    /// `Some(old_name)` when editing an existing entry.
-    pub original_name: Option<String>,
+    /// `Some(key)` when editing an existing entry.
+    pub original: Option<EntryKey>,
     pub fields: Vec<Field>,
     pub focus: usize,
     /// A validation error to show after a failed save attempt.
@@ -87,7 +87,7 @@ impl Form {
     pub fn new_entry() -> Self {
         Form {
             title: "Add entry".into(),
-            original_name: None,
+            original: None,
             fields: Self::blank_fields(),
             focus: 0,
             error: None,
@@ -109,7 +109,7 @@ impl Form {
         fields[EXAMPLES].value = entry.examples.clone();
         Form {
             title: format!("Edit {}", entry.name),
-            original_name: Some(entry.name.clone()),
+            original: Some(EntryKey::of(entry)),
             fields,
             focus: 0,
             error: None,
@@ -170,6 +170,7 @@ impl Form {
         let description = self.fields[DESCRIPTION].value.trim().to_string();
 
         let mut entry = Entry::new(name, kind, command, description);
+        entry.scope = self.original.as_ref().and_then(|k| k.scope.clone());
         let category = self.fields[CATEGORY].value.trim();
         if !category.is_empty() {
             entry.category = category.to_string();
@@ -219,11 +220,37 @@ mod tests {
         e.category = "ruby".into();
         e.tags = vec!["ruby".into(), "server".into()];
         let form = Form::edit(&e);
-        assert_eq!(form.original_name.as_deref(), Some("kruby"));
+        assert_eq!(form.original, Some(EntryKey::global("kruby")));
         let back = form.to_entry().unwrap();
         assert_eq!(back.kind, Kind::Function);
         assert_eq!(back.tags, vec!["ruby", "server"]);
         assert_eq!(back.category, "ruby");
+    }
+
+    #[test]
+    fn edit_form_round_trips_the_scope() {
+        let mut e = Entry::new("ll", Kind::Alias, "ls -la", "list");
+        e.scope = Some("api".into());
+        let form = Form::edit(&e);
+        assert_eq!(
+            form.original,
+            Some(EntryKey {
+                scope: Some("api".into()),
+                name: "ll".into()
+            })
+        );
+        assert_eq!(form.to_entry().unwrap().scope, Some("api".to_string()));
+    }
+
+    #[test]
+    fn new_form_builds_a_global_entry() {
+        let mut form = Form::new_entry();
+        for c in "ll".chars() {
+            form.input(c);
+        }
+        form.fields[COMMAND].value = "ls -la".into();
+        form.fields[DESCRIPTION].value = "list".into();
+        assert_eq!(form.to_entry().unwrap().scope, None);
     }
 
     #[test]

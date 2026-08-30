@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use cmd_man::backup;
 use cmd_man::config::Config;
-use cmd_man::model::{Entry, Kind};
+use cmd_man::model::{Entry, EntryKey, Kind};
 use cmd_man::paths::Paths;
 use cmd_man::shell::Shell;
 use cmd_man::store::Store;
@@ -127,7 +127,7 @@ fn sync_bootstraps_empty_store_from_remote() {
 
     let loaded = Store::load(&paths).unwrap();
     assert!(
-        loaded.find("seeded").is_some(),
+        loaded.find(&EntryKey::global("seeded")).is_some(),
         "bootstrap did not import entry"
     );
 
@@ -163,7 +163,7 @@ fn sync_does_not_clobber_local_only_entries() {
     // The local entry survives regardless of the sync outcome.
     let loaded = Store::load(&paths).unwrap();
     assert!(
-        loaded.find("localonly").is_some(),
+        loaded.find(&EntryKey::global("localonly")).is_some(),
         "local-only entry must not be clobbered by a populated remote"
     );
 }
@@ -190,9 +190,12 @@ fn sync_merges_disjoint_categories_across_machines() {
     let status = backup::read_status(&b_paths).unwrap();
     assert_eq!(status.outcome, "ok", "message: {}", status.message);
     let loaded = Store::load(&b_paths).unwrap();
-    assert!(loaded.find("cls").is_some(), "local entry lost");
     assert!(
-        loaded.find("gitsw").is_some(),
+        loaded.find(&EntryKey::global("cls")).is_some(),
+        "local entry lost"
+    );
+    assert!(
+        loaded.find(&EntryKey::global("gitsw")).is_some(),
         "remote entry did not merge in"
     );
 }

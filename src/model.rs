@@ -59,8 +59,12 @@ pub const DEFAULT_CATEGORY: &str = "general";
 /// A single managed alias or function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    /// The shell alias the user types (e.g. `gitsw`). Unique across the store.
+    /// The shell alias the user types (e.g. `gitsw`). Unique within its scope.
     pub name: String,
+    /// The id of the directory scope this entry belongs to, or `None` when the
+    /// entry is global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub kind: Kind,
     /// For an alias, the expansion. For a function, the body.
     pub command: String,
@@ -101,6 +105,7 @@ impl Entry {
     ) -> Self {
         Entry {
             name: name.into(),
+            scope: None,
             kind,
             command: command.into(),
             description: description.into(),
@@ -149,13 +154,49 @@ impl Entry {
     /// A single-line haystack used for fuzzy searching.
     pub fn search_haystack(&self) -> String {
         format!(
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
             self.name,
             self.command,
             self.description,
             self.category,
-            self.tags.join(" ")
+            self.tags.join(" "),
+            self.scope.as_deref().unwrap_or_default()
         )
+    }
+}
+
+/// Identifies an entry: a name plus the scope it lives in.
+///
+/// The derived ordering puts `None` (global) before any scoped entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntryKey {
+    pub scope: Option<String>,
+    pub name: String,
+}
+
+impl EntryKey {
+    /// The key of an unscoped entry.
+    pub fn global(name: impl Into<String>) -> Self {
+        EntryKey {
+            scope: None,
+            name: name.into(),
+        }
+    }
+
+    /// The key of an existing entry.
+    pub fn of(entry: &Entry) -> Self {
+        EntryKey {
+            scope: entry.scope.clone(),
+            name: entry.name.clone(),
+        }
+    }
+
+    /// A user-facing label: `ll` when global, `ll (api)` when scoped.
+    pub fn label(&self) -> String {
+        match &self.scope {
+            Some(scope) => format!("{} ({scope})", self.name),
+            None => self.name.clone(),
+        }
     }
 }
 
@@ -195,5 +236,36 @@ mod tests {
             let e = Entry::new(bad, Kind::Alias, "echo hi", "desc");
             assert!(e.validate().is_err(), "expected '{bad}' to be rejected");
         }
+    }
+
+    #[test]
+    fn scope_is_optional_and_omitted_when_global() {
+        let entry = Entry::new("ll", Kind::Alias, "ls -la", "d");
+        assert_eq!(entry.scope, None);
+        let text = toml::to_string(&entry).unwrap();
+        assert!(
+            !text.contains("scope"),
+            "global entries should not serialize a scope: {text}"
+        );
+    }
+
+    #[test]
+    fn scope_id_is_searchable() {
+        let mut entry = Entry::new("ll", Kind::Alias, "ls -la", "d");
+        entry.scope = Some("api".into());
+        assert!(entry.search_haystack().contains("api"));
+    }
+
+    #[test]
+    fn entry_key_labels_disambiguate() {
+        assert_eq!(EntryKey::global("ll").label(), "ll");
+        assert_eq!(
+            EntryKey {
+                scope: Some("api".into()),
+                name: "ll".into()
+            }
+            .label(),
+            "ll (api)"
+        );
     }
 }

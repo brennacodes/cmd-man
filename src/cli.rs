@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::app::{App, now_timestamp};
 use crate::backup;
 use crate::capture;
-use crate::model::{Entry, Kind};
+use crate::model::{Entry, EntryKey, Kind};
 use crate::paths::Paths;
 use crate::search::Filter;
 use crate::shell::{self, Shell};
@@ -289,11 +289,12 @@ fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
 
 fn cmd_edit(args: EditArgs) -> Result<()> {
     let mut app = App::load()?;
+    let key = EntryKey::global(&args.name);
     let mut entry = app
         .store
-        .find(&args.name)
+        .find(&key)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no entry named '{}'", args.name))?;
+        .ok_or_else(|| anyhow::anyhow!("no entry '{}'", key.label()))?;
 
     if let Some(c) = args.command {
         entry.command = c;
@@ -321,17 +322,17 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
         app.fill_from_help(&mut entry);
     }
 
-    let target = args.name.clone();
-    app.update(&target, entry)?;
-    println!("Updated '{target}'.");
+    app.update(&key, entry)?;
+    println!("Updated '{}'.", key.label());
     print_reload_hint(&app);
     Ok(())
 }
 
 fn cmd_rm(name: &str) -> Result<()> {
     let mut app = App::load()?;
-    app.remove(name)?;
-    println!("Removed '{name}'.");
+    let key = EntryKey::global(name);
+    app.remove(&key)?;
+    println!("Removed '{}'.", key.label());
     print_reload_hint(&app);
     Ok(())
 }
@@ -342,11 +343,12 @@ fn cmd_capture(name: &str, yes: bool) -> Result<()> {
 }
 
 fn do_capture(app: &mut App, name: &str, yes: bool) -> Result<()> {
+    let key = EntryKey::global(name);
     let entry = app
         .store
-        .find(name)
+        .find(&key)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no entry named '{name}'"))?;
+        .ok_or_else(|| anyhow::anyhow!("no entry '{}'", key.label()))?;
 
     let assessment = app.assess(&entry);
     if assessment.is_blocked() {
@@ -381,7 +383,7 @@ fn do_capture(app: &mut App, name: &str, yes: bool) -> Result<()> {
     }
     println!("Captured via {} backend.", result.backend);
     app.record_capture(
-        name,
+        &key,
         result.output.trim().to_string(),
         assessment.destructive,
     )?;
@@ -399,7 +401,7 @@ fn cmd_import(yes: bool) -> Result<()> {
 
     let aliases = shell::collect_active_aliases(shell)?;
     let functions = shell::collect_active_functions(shell)?;
-    let known = |n: &str| app.store.find(n).is_some();
+    let known = |n: &str| !app.store.find_all_named(n).is_empty();
     let mut candidates = shell::importable_entries(&aliases, Kind::Alias, &known);
     candidates.extend(shell::importable_entries(
         &functions,

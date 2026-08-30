@@ -7,7 +7,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::capture::{self, Assessment, CaptureResult};
 use crate::config::Config;
-use crate::model::{CapturePolicy, Entry};
+use crate::model::{CapturePolicy, Entry, EntryKey};
 use crate::paths::Paths;
 use crate::search::{Filter, search};
 use crate::shell;
@@ -67,15 +67,15 @@ impl App {
         self.persist()
     }
 
-    /// Update an entry (matched by `name`) and persist.
-    pub fn update(&mut self, name: &str, entry: Entry) -> Result<()> {
-        self.store.update(name, entry)?;
+    /// Update an entry (matched by `key`) and persist.
+    pub fn update(&mut self, key: &EntryKey, entry: Entry) -> Result<()> {
+        self.store.update(key, entry)?;
         self.persist()
     }
 
     /// Remove an entry and persist.
-    pub fn remove(&mut self, name: &str) -> Result<Entry> {
-        let removed = self.store.remove(name)?;
+    pub fn remove(&mut self, key: &EntryKey) -> Result<Entry> {
+        let removed = self.store.remove(key)?;
         self.persist()?;
         Ok(removed)
     }
@@ -122,12 +122,17 @@ impl App {
 
     /// Record captured output on an entry and persist. Marks the entry
     /// destructive when the assessment says so.
-    pub fn record_capture(&mut self, name: &str, output: String, destructive: bool) -> Result<()> {
+    pub fn record_capture(
+        &mut self,
+        key: &EntryKey,
+        output: String,
+        destructive: bool,
+    ) -> Result<()> {
         let mut entry = self
             .store
-            .find(name)
+            .find(key)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no entry named '{name}'"))?;
+            .ok_or_else(|| anyhow::anyhow!("no entry '{}'", key.label()))?;
         entry.example_output = output;
         if destructive {
             entry.destructive = true;
@@ -135,7 +140,7 @@ impl App {
                 entry.capture_policy = CapturePolicy::Confirm;
             }
         }
-        self.update(name, entry)
+        self.update(key, entry)
     }
 }
 
@@ -174,7 +179,7 @@ mod tests {
         let (dir, mut app) = temp_app();
         app.add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"))
             .unwrap();
-        app.remove("gitsw").unwrap();
+        app.remove(&EntryKey::global("gitsw")).unwrap();
         let zsh = std::fs::read_to_string(dir.path().join("shell/cmd-man.zsh")).unwrap();
         assert!(!zsh.contains("gitsw"));
     }
@@ -184,9 +189,13 @@ mod tests {
         let (_dir, mut app) = temp_app();
         app.add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"))
             .unwrap();
-        app.record_capture("gitsw", "Switched to branch 'main'".into(), true)
-            .unwrap();
-        let e = app.store.find("gitsw").unwrap();
+        app.record_capture(
+            &EntryKey::global("gitsw"),
+            "Switched to branch 'main'".into(),
+            true,
+        )
+        .unwrap();
+        let e = app.store.find(&EntryKey::global("gitsw")).unwrap();
         assert_eq!(e.example_output, "Switched to branch 'main'");
         assert!(e.destructive);
         assert_eq!(e.capture_policy, CapturePolicy::Confirm);

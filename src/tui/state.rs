@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Entry, Kind};
+use crate::model::{Entry, EntryKey, Kind};
 use crate::search::{Filter, search};
 
 /// An operation the run loop must carry out against the App.
@@ -15,14 +15,14 @@ pub enum Action {
     },
     Reload,
     Backup,
-    Delete(String),
+    Delete(EntryKey),
     /// User asked to capture; the run loop decides if confirmation is needed.
-    CaptureRequest(String),
+    CaptureRequest(EntryKey),
     /// Capture confirmed in a popup.
-    CaptureConfirmed(String),
-    /// Submit an add (original == None) or edit (original == Some(old_name)).
+    CaptureConfirmed(EntryKey),
+    /// Submit an add (original == None) or edit (original == Some(old_key)).
     Submit {
-        original: Option<String>,
+        original: Option<EntryKey>,
         entry: Box<Entry>,
         /// Whether to auto-fill empty help fields before saving.
         autofill: bool,
@@ -32,8 +32,8 @@ pub enum Action {
 /// What a confirmation popup is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmKind {
-    Delete(String),
-    Capture(String),
+    Delete(EntryKey),
+    Capture(EntryKey),
 }
 
 /// The active interaction mode.
@@ -76,9 +76,9 @@ impl UiState {
         state
     }
 
-    /// Replace entries (after a mutation), preserving the selected item by name.
+    /// Replace entries (after a mutation), preserving the selected item by key.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
-        let current_name = self.selected_entry().map(|e| e.name.clone());
+        let current = self.selected_entry().map(EntryKey::of);
         self.entries = entries;
         self.rebuild_categories();
         // Drop a category filter that no longer exists.
@@ -88,11 +88,11 @@ impl UiState {
             self.category_filter = None;
         }
         self.refilter();
-        if let Some(name) = current_name
+        if let Some(key) = current
             && let Some(pos) = self
                 .filtered
                 .iter()
-                .position(|&i| self.entries[i].name == name)
+                .position(|&i| EntryKey::of(&self.entries[i]) == key)
         {
             self.selected = pos;
         }
@@ -111,16 +111,16 @@ impl UiState {
             category: self.category_filter.clone(),
             kind: self.kind_filter,
         };
-        let index: HashMap<&str, usize> = self
+        let index: HashMap<EntryKey, usize> = self
             .entries
             .iter()
             .enumerate()
-            .map(|(i, e)| (e.name.as_str(), i))
+            .map(|(i, e)| (EntryKey::of(e), i))
             .collect();
         let ordered = search(&self.entries, &self.query, &filter);
         self.filtered = ordered
             .iter()
-            .filter_map(|e| index.get(e.name.as_str()).copied())
+            .filter_map(|e| index.get(&EntryKey::of(e)).copied())
             .collect();
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);

@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 
 use crate::app::{App, now_timestamp};
 use crate::backup;
+use crate::model::EntryKey;
 
 use form::Form;
 use state::{Action, ConfirmKind, Mode, UiState};
@@ -103,7 +104,7 @@ fn handle_form_key(form: &mut Option<Form>, key: KeyEvent) -> Option<Action> {
         }
         KeyCode::Enter => match f.to_entry() {
             Ok(entry) => {
-                let original = f.original_name.clone();
+                let original = f.original.clone();
                 // Skip the on-save fetch if help was already pulled for this
                 // exact command via Ctrl-F.
                 let autofill = f.helped_command.as_deref() != Some(f.command_value());
@@ -174,16 +175,17 @@ fn handle_browse_key(state: &mut UiState, key: KeyEvent) -> Option<Action> {
         KeyCode::Char('b') => return Some(Action::Backup),
         KeyCode::Char('d') => {
             if let Some(entry) = state.selected_entry() {
-                let name = entry.name.clone();
+                let key = EntryKey::of(entry);
+                let label = key.label();
                 state.mode = Mode::Confirm {
-                    kind: ConfirmKind::Delete(name.clone()),
-                    message: format!("Delete '{name}'? This regenerates your shell files."),
+                    kind: ConfirmKind::Delete(key),
+                    message: format!("Delete '{label}'? This regenerates your shell files."),
                 };
             }
         }
         KeyCode::Char('c') => {
             if let Some(entry) = state.selected_entry() {
-                return Some(Action::CaptureRequest(entry.name.clone()));
+                return Some(Action::CaptureRequest(EntryKey::of(entry)));
             }
         }
         _ => {}
@@ -208,8 +210,8 @@ fn handle_confirm_key(state: &mut UiState, kind: ConfirmKind, key: KeyEvent) -> 
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             state.mode = Mode::Browse;
             match kind {
-                ConfirmKind::Delete(name) => Some(Action::Delete(name)),
-                ConfirmKind::Capture(name) => Some(Action::CaptureConfirmed(name)),
+                ConfirmKind::Delete(key) => Some(Action::Delete(key)),
+                ConfirmKind::Capture(key) => Some(Action::CaptureConfirmed(key)),
             }
         }
         _ => {
@@ -235,10 +237,10 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
             }
             Err(e) => state.set_status(format!("Backup failed: {e}")),
         },
-        Action::Delete(name) => match app.remove(&name) {
+        Action::Delete(key) => match app.remove(&key) {
             Ok(_) => {
                 refresh(app, state);
-                state.set_status(format!("Deleted '{name}'"));
+                state.set_status(format!("Deleted '{}'", key.label()));
             }
             Err(e) => state.set_status(format!("Delete failed: {e}")),
         },
@@ -251,7 +253,7 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
             if autofill {
                 app.fill_from_help(&mut entry);
             }
-            let name = entry.name.clone();
+            let label = EntryKey::of(&entry).label();
             let result = match &original {
                 Some(old) => app.update(old, entry),
                 None => app.add(entry),
@@ -259,16 +261,17 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
             match result {
                 Ok(()) => {
                     refresh(app, state);
-                    state.set_status(format!("Saved '{name}'"));
+                    state.set_status(format!("Saved '{label}'"));
                 }
                 Err(e) => state.set_status(format!("Save failed: {e}")),
             }
         }
-        Action::CaptureRequest(name) => {
-            if let Some(entry) = app.store.find(&name).cloned() {
+        Action::CaptureRequest(key) => {
+            if let Some(entry) = app.store.find(&key).cloned() {
                 let assessment = app.assess(&entry);
+                let label = key.label();
                 if assessment.is_blocked() {
-                    state.set_status(format!("Capture disabled for '{name}'"));
+                    state.set_status(format!("Capture disabled for '{label}'"));
                 } else if assessment.needs_confirmation() {
                     let reasons = if assessment.reasons.is_empty() {
                         String::new()
@@ -276,28 +279,28 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
                         format!(" ({})", assessment.reasons.join("; "))
                     };
                     state.mode = Mode::Confirm {
-                        kind: ConfirmKind::Capture(name.clone()),
-                        message: format!("Run '{name}' to capture output?{reasons}"),
+                        kind: ConfirmKind::Capture(key),
+                        message: format!("Run '{label}' to capture output?{reasons}"),
                     };
                 } else {
-                    perform_capture(app, state, &name, assessment.destructive);
+                    perform_capture(app, state, &key, assessment.destructive);
                 }
             }
         }
-        Action::CaptureConfirmed(name) => {
+        Action::CaptureConfirmed(key) => {
             let destructive = app
                 .store
-                .find(&name)
+                .find(&key)
                 .map(|e| app.assess(e).destructive)
                 .unwrap_or(false);
-            perform_capture(app, state, &name, destructive);
+            perform_capture(app, state, &key, destructive);
         }
     }
     Ok(())
 }
 
-fn perform_capture(app: &mut App, state: &mut UiState, name: &str, destructive: bool) {
-    let entry = match app.store.find(name).cloned() {
+fn perform_capture(app: &mut App, state: &mut UiState, key: &EntryKey, destructive: bool) {
+    let entry = match app.store.find(key).cloned() {
         Some(e) => e,
         None => return,
     };
@@ -305,12 +308,12 @@ fn perform_capture(app: &mut App, state: &mut UiState, name: &str, destructive: 
         Ok(result) => {
             let note = if result.timed_out { " (timed out)" } else { "" };
             let backend = result.backend;
-            if let Err(e) = app.record_capture(name, result.output.trim().to_string(), destructive)
-            {
+            if let Err(e) = app.record_capture(key, result.output.trim().to_string(), destructive) {
                 state.set_status(format!("Capture save failed: {e}"));
             } else {
                 refresh(app, state);
-                state.set_status(format!("Captured '{name}' via {backend}{note}"));
+                let label = key.label();
+                state.set_status(format!("Captured '{label}' via {backend}{note}"));
             }
         }
         Err(e) => state.set_status(format!("Capture failed: {e}")),
@@ -372,7 +375,7 @@ mod tests {
         assert!(none.is_none());
         assert!(matches!(state.mode, Mode::Confirm { .. }));
         let action = handle_key(&mut state, key(KeyCode::Char('y')));
-        assert_eq!(action, Some(Action::Delete("gitsw".into())));
+        assert_eq!(action, Some(Action::Delete(EntryKey::global("gitsw"))));
     }
 
     #[test]
@@ -422,7 +425,35 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert!(app.store.find("gitsw").is_some());
+        assert!(app.store.find(&EntryKey::global("gitsw")).is_some());
         assert_eq!(state.filtered_entries().len(), 1);
+    }
+
+    #[test]
+    fn editing_a_scoped_entry_keeps_it_in_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        let mut app = App::with(paths, Config::default(), Store::default());
+        let mut state = UiState::new(vec![]);
+        let mut scoped = Entry::new("ll", Kind::Alias, "ls -la", "list");
+        scoped.scope = Some("api".into());
+        app.add(scoped.clone()).unwrap();
+
+        let form = Form::edit(&scoped);
+        let original = form.original.clone();
+        let rebuilt = form.to_entry().unwrap();
+        execute(
+            Action::Submit {
+                original,
+                entry: Box::new(rebuilt),
+                autofill: false,
+            },
+            &mut app,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.store.entries().len(), 1);
+        assert_eq!(app.store.entries()[0].scope, Some("api".to_string()));
     }
 }
