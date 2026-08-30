@@ -28,6 +28,27 @@ fn store_dir(home: &TempDir) -> std::path::PathBuf {
     home.path().join("store")
 }
 
+/// True when zsh is installed. Probing by spawning avoids depending on any
+/// particular lookup tool being present.
+fn have_zsh() -> bool {
+    std::process::Command::new("zsh")
+        .arg("-c")
+        .arg("exit 0")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Every entry the store holds, read straight off disk so assertions do not
+/// depend on CLI output formatting.
+fn app_entries(home: &TempDir) -> Vec<cmd_man::model::Entry> {
+    let paths = cmd_man::paths::Paths::with_root(store_dir(home));
+    cmd_man::store::Store::load(&paths)
+        .unwrap()
+        .entries()
+        .to_vec()
+}
+
 #[test]
 fn add_generates_live_alias_and_lists_it() {
     let home = TempDir::new().unwrap();
@@ -912,4 +933,44 @@ fn capture_of_a_scoped_entry_runs_in_the_scope_directory() {
     // Sanitization rewrites the home prefix, so the scope-relative tail is what
     // distinguishes a run inside the scope from one in the process directory.
     assert!(toml.contains("work/api"), "expected work/api in: {toml}");
+}
+
+#[test]
+fn import_does_not_duplicate_a_scoped_name_as_a_global() {
+    // The scan spawns an interactive zsh; without one there is nothing to scan.
+    if !have_zsh() {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, &api)
+        .args(["add", "dep", "-c", "echo scoped", "--desc", "s", "--here"])
+        .assert()
+        .success();
+
+    // Install the rc block first, and point zsh's rc lookup at the temp home,
+    // so the shell that import scans reports the scoped alias when it starts
+    // inside the scope.
+    cmd(&home).args(["init"]).assert().success();
+    cmd_in(&home, &api)
+        .env("ZDOTDIR", home.path())
+        .args(["import", "--yes"])
+        .assert()
+        .success();
+
+    let all = app_entries(&home);
+    assert_eq!(all.iter().filter(|e| e.name == "dep").count(), 1);
+    assert_eq!(
+        all.iter()
+            .find(|e| e.name == "dep")
+            .unwrap()
+            .scope
+            .as_deref(),
+        Some("api")
+    );
+    // The generated file autoloads `add-zsh-hook` to register the dispatcher,
+    // so the scanned shell reports it as a defined function.
+    assert!(all.iter().all(|e| e.name != "add-zsh-hook"));
 }

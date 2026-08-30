@@ -546,6 +546,12 @@ pub fn collect_active_aliases(shell: Shell) -> Result<Vec<(String, String)>> {
 /// manage.
 const SHELL_INTERNAL_ALIASES: &[&str] = &["run-help", "run-suite", "run-test", "which-command"];
 
+/// Functions the shell defines for its own tooling. `add-zsh-hook` is the one
+/// cmd-man's own generated file autoloads to register the scope dispatcher, so
+/// a scan started from a shell that sourced it would otherwise import zsh's
+/// helper as a user function and then take ownership of the name.
+const SHELL_INTERNAL_FUNCTIONS: &[&str] = &["add-zsh-hook"];
+
 fn run_shell_snippet(shell: Shell, snippet: &str, timeout: Duration) -> Result<String> {
     use std::io::Read;
 
@@ -609,8 +615,13 @@ pub fn collect_active_functions(shell: Shell) -> Result<Vec<(String, String)>> {
     let output = run_shell_snippet(shell, snippet, Duration::from_secs(10))?;
     Ok(parse_functions(&output)
         .into_iter()
-        .filter(|(name, _)| is_importable_name(name))
+        .filter(|(name, _)| is_importable_function(name))
         .collect())
+}
+
+/// Whether a discovered function should be offered for import.
+fn is_importable_function(name: &str) -> bool {
+    is_importable_name(name) && !SHELL_INTERNAL_FUNCTIONS.contains(&name)
 }
 
 /// Whether a discovered function name is a safe, importable trigger.
@@ -1198,6 +1209,21 @@ mod tests {
     }
 
     #[test]
+    fn importable_entries_skip_names_known_in_any_scope() {
+        let active = vec![
+            ("ll".to_string(), "ls -la".to_string()),
+            ("dep".to_string(), "deploy".to_string()),
+        ];
+        // The store knows 'dep' only inside a scope, so the shell still reports
+        // it while the scope is active. It must not be imported again.
+        let known = |n: &str| n == "dep";
+        let out = importable_entries(&active, Kind::Alias, &known);
+        let names: Vec<_> = out.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["ll"]);
+        assert!(out[0].scope.is_none(), "imported entries stay global");
+    }
+
+    #[test]
     fn parses_zsh_style_functions() {
         let text = "kruby () {\n\techo hi\n\tkill -9 1\n}\ngreet () {\n\techo hello\n}\n";
         let parsed = parse_functions(text);
@@ -1232,5 +1258,12 @@ mod tests {
         assert!(!is_importable_name("_private"));
         assert!(!is_importable_name("has:colon"));
         assert!(!is_importable_name(""));
+    }
+
+    #[test]
+    fn importable_function_skips_the_hook_helper_the_generated_file_autoloads() {
+        assert!(is_importable_function("gitsw"));
+        assert!(!is_importable_function("_cmdman_apply"));
+        assert!(!is_importable_function("add-zsh-hook"));
     }
 }
