@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use cmd_man::model::{Entry, EntryKey, Kind};
 use cmd_man::paths::{Paths, portable_path_with};
-use cmd_man::scopes::ScopeRegistry;
+use cmd_man::scopes::{Scope, ScopeRegistry};
 use cmd_man::store::Store;
 use tempfile::TempDir;
 
@@ -180,6 +180,61 @@ fn scope_path_is_stored_home_relative_and_expanded_when_rendered() {
             rendered.contains(&format!("_cmdman_dir_1='{}'", api.display())),
             "{shell} file was: {rendered}"
         );
+    }
+}
+
+/// `scopes.toml` is what backup and sync carry, so a hand edit, a bad merge or
+/// a hostile backup repo can put anything in it. Neither an id nor a directory
+/// out of it may become code in a file every new shell sources.
+#[test]
+fn an_injected_scope_registry_defines_nothing_in_either_shell() {
+    let mut fx = Fixture::new();
+    let api = fx.dir("work/api");
+    fx.add_scoped(&api, "dep", Kind::Alias, "echo dep");
+
+    let injected_id = "bad\nalias pwned='echo PWNED'\nfoo";
+    let one = fx.dir("work/one");
+    fx.scopes.insert(Scope {
+        id: injected_id.into(),
+        path: portable_path_with(&one, Some(&fx.home)),
+        created_at: "2026-08-29T00:00:00Z".into(),
+    });
+    let two = fx.dir("work/two");
+    fx.scopes.insert(Scope {
+        id: "two".into(),
+        path: format!(
+            "{}\nalias owned='echo OWNED'\n#",
+            portable_path_with(&two, Some(&fx.home))
+        ),
+        created_at: "2026-08-29T00:00:00Z".into(),
+    });
+    for (name, scope) in [("one", injected_id), ("two", "two")] {
+        let mut entry = Entry::new(name, Kind::Alias, "echo scoped", "d");
+        entry.scope = Some(scope.into());
+        fx.store.add(entry).unwrap();
+    }
+    fx.generate();
+
+    for shell in ["zsh", "bash"] {
+        let rendered = std::fs::read_to_string(fx.file(shell)).unwrap();
+        assert!(!rendered.contains("PWNED"), "{shell} file was: {rendered}");
+        assert!(!rendered.contains("OWNED"), "{shell} file was: {rendered}");
+        if !have(shell) {
+            continue;
+        }
+        // The healthy scope still gets its block, which means the file parsed
+        // all the way through rather than dying at an injected line.
+        let out = run_shell(
+            shell,
+            &fx.file(shell),
+            &format!(
+                "type pwned\ntype owned\ncd '{}'\n_cmdman_apply\neval dep\n",
+                api.display()
+            ),
+        );
+        assert!(!out.contains("PWNED"), "{shell} out was: {out}");
+        assert!(!out.contains("OWNED"), "{shell} out was: {out}");
+        assert!(out.contains("dep"), "{shell} out was: {out}");
     }
 }
 

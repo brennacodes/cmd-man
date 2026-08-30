@@ -192,7 +192,21 @@ impl ScopeRegistry {
             if scope.id.trim().is_empty() {
                 issues.push(format!(
                     "scope for '{}' has an empty id and is ignored",
-                    scope.path
+                    one_line(&scope.path)
+                ));
+                continue;
+            }
+            if !is_valid_id(&scope.id) {
+                issues.push(format!(
+                    "scope id '{}' is not usable and is ignored: use letters, digits, '-' and '_'",
+                    one_line(&scope.id)
+                ));
+                continue;
+            }
+            if !is_valid_path(&scope.path) {
+                issues.push(format!(
+                    "scope '{}' has an unusable directory and is ignored",
+                    scope.id
                 ));
                 continue;
             }
@@ -207,7 +221,8 @@ impl ScopeRegistry {
             if dirs.contains(&dir) {
                 issues.push(format!(
                     "duplicate scope path '{}' for scope '{}'; only the first is used",
-                    scope.path, scope.id
+                    one_line(&scope.path),
+                    scope.id
                 ));
                 continue;
             }
@@ -261,6 +276,23 @@ pub fn is_valid_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Whether a stored scope directory is safe to keep. The path cannot be
+/// narrowed to a character class the way an id can, since it is whatever the
+/// user's filesystem holds, but a control character in it would end the
+/// generated file's scope comment line early and turn the rest into code.
+pub fn is_valid_path(path: &str) -> bool {
+    !path.is_empty() && !path.chars().any(char::is_control)
+}
+
+/// `text` with its control characters replaced by spaces, so a registry value
+/// echoed into the generated shell file's scope comment or into a load notice
+/// cannot end the line it sits on.
+pub fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Make `dir` absolute against `base` and resolve `.` and `..` textually.
@@ -430,6 +462,11 @@ mod tests {
         ScopeRegistry::from_scopes(scopes)
     }
 
+    /// `plan_create` under a fixed timestamp.
+    fn plan(reg: &ScopeRegistry, dir: &str) -> Scope {
+        reg.plan_create(Path::new(dir), "now")
+    }
+
     #[test]
     fn slug_id_uses_the_directory_basename() {
         assert_eq!(slug_id(Path::new("/Users/ada/work/api")), "api");
@@ -442,24 +479,21 @@ mod tests {
     #[test]
     fn plan_create_dedupes_ids_and_avoids_reserved_words() {
         let reg = registry(vec![scope("api", "/a/api")]);
-        assert_eq!(reg.plan_create(Path::new("/b/api"), "now").id, "api-2");
+        assert_eq!(plan(&reg, "/b/api").id, "api-2");
 
         let reg = registry(vec![scope("api", "/a/api"), scope("api-2", "/b/api")]);
-        assert_eq!(reg.plan_create(Path::new("/c/api"), "now").id, "api-3");
+        assert_eq!(plan(&reg, "/c/api").id, "api-3");
 
         let reg = registry(vec![]);
-        assert_eq!(
-            reg.plan_create(Path::new("/x/global"), "now").id,
-            "global-2"
-        );
-        assert_eq!(reg.plan_create(Path::new("/x/all"), "now").id, "all-2");
-        assert_eq!(reg.plan_create(Path::new("/x/here"), "now").id, "here-2");
+        assert_eq!(plan(&reg, "/x/global").id, "global-2");
+        assert_eq!(plan(&reg, "/x/all").id, "all-2");
+        assert_eq!(plan(&reg, "/x/here").id, "here-2");
     }
 
     #[test]
     fn plan_create_does_not_mutate() {
         let mut reg = registry(vec![]);
-        let planned = reg.plan_create(Path::new("/x/api"), "now");
+        let planned = plan(&reg, "/x/api");
         assert!(reg.is_empty());
         reg.insert(planned);
         assert_eq!(reg.scopes().len(), 1);
@@ -515,6 +549,50 @@ mod tests {
         assert!(!is_valid_id("bad\nalias pwned=oops #"));
         assert!(!is_valid_id("a b"));
         assert!(!is_valid_id("a'b"));
+    }
+
+    #[test]
+    fn path_validation_rejects_control_characters() {
+        assert!(is_valid_path("$HOME/work/api"));
+        assert!(is_valid_path("/a dir/with spaces & 'quotes'"));
+        assert!(!is_valid_path(""));
+        assert!(!is_valid_path("/w/zz\nalias pwned='echo OWNED'\n#"));
+        assert!(!is_valid_path("/a\rb"));
+        assert_eq!(one_line("a\nb\tc"), "a b c");
+    }
+
+    #[test]
+    fn a_scope_that_could_inject_shell_code_is_dropped_at_load() {
+        let injected_id = "api\nalias pwned='echo PWNED'\nfoo";
+        let injected_path = "/w/zz\nalias pwned='echo PWNED'\n#";
+        let reg = registry(vec![
+            scope(injected_id, "/w/one"),
+            scope("two", injected_path),
+            scope("ok", "/w/three"),
+        ]);
+
+        let rendered: Vec<_> = reg.render_order().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(rendered, vec!["ok"]);
+        let issues = reg.issues();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("is not usable and is ignored")),
+            "issues were: {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("has an unusable directory")),
+            "issues were: {issues:?}"
+        );
+        // A notice is one line, so a value quoted into it cannot fake a second.
+        assert!(
+            issues.iter().all(|i| !i.contains('\n')),
+            "issues were: {issues:?}"
+        );
+        // Kept in memory so a save after a load never drops a hand-edited line.
+        assert_eq!(reg.scopes().len(), 3);
     }
 
     #[test]

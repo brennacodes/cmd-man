@@ -272,7 +272,7 @@ impl App {
                 None
             }
             Target::NewAt(dir) => {
-                let scope = self.scopes.plan_create(&dir, &now_timestamp());
+                let scope = self.plan_scope(&dir)?;
                 entry.scope = Some(scope.id.clone());
                 Some(scope)
             }
@@ -312,7 +312,7 @@ impl App {
                     None
                 }
                 Target::NewAt(dir) => {
-                    let scope = self.scopes.plan_create(&dir, &now_timestamp());
+                    let scope = self.plan_scope(&dir)?;
                     entry.scope = Some(scope.id.clone());
                     Some(scope)
                 }
@@ -325,6 +325,20 @@ impl App {
         }
         self.persist()?;
         Ok(new_key)
+    }
+
+    /// The scope a directory with no scope yet would get, refusing a directory
+    /// the generated shell files cannot carry.
+    fn plan_scope(&self, dir: &Path) -> Result<Scope> {
+        let path = paths::portable_path(dir);
+        if !scopes::is_valid_path(&path) {
+            bail!(
+                "cannot scope to '{}': a directory name with a control character in it \
+                 cannot be written to the generated shell files",
+                scopes::one_line(&path)
+            );
+        }
+        Ok(self.scopes.plan_create(dir, &now_timestamp()))
     }
 
     /// Remove an entry and persist.
@@ -379,6 +393,14 @@ impl App {
         // dispatcher matches the logical `$PWD`. Only made absolute, never
         // resolved through symlinks.
         let dir = scopes::normalize_dir(&self.cwd, dir);
+        let path = paths::portable_path(&dir);
+        if !scopes::is_valid_path(&path) {
+            bail!(
+                "cannot scope to '{}': a directory name with a control character in it \
+                 cannot be written to the generated shell files",
+                scopes::one_line(&path)
+            );
+        }
         // Compared through symlinks rather than by exact text, so a scope
         // stored the way the shell names a directory still counts as the
         // claim on the directory this relocation just resolved.
@@ -388,18 +410,14 @@ impl App {
             .iter()
             .find(|s| s.id != id && scopes::same_dir(&paths::expand_path(&s.path), &dir))
         {
-            bail!(
-                "'{}' is already the scope for {}",
-                other.id,
-                paths::portable_path(&dir)
-            );
+            bail!("'{}' is already the scope for {}", other.id, path);
         }
         if self.scopes.find(id).is_some() {
             self.scopes.relocate(id, &dir)?;
         } else {
             self.scopes.insert(Scope {
                 id: id.to_string(),
-                path: paths::portable_path(&dir),
+                path,
                 created_at: now_timestamp(),
             });
         }
@@ -690,6 +708,29 @@ mod tests {
             app.scopes.resolved_path("api").unwrap(),
             root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn a_scope_directory_the_shell_files_cannot_carry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let weird = dir.path().join("we\nird");
+        std::fs::create_dir_all(&weird).unwrap();
+        let mut app = test_app(&dir).with_cwd(weird.canonicalize().unwrap());
+
+        let err = app
+            .add(
+                Entry::new("dep", Kind::Alias, "make deploy", "d"),
+                &Placement::Here,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control character"), "err was: {err}");
+        assert!(app.scopes.scopes().is_empty());
+        assert!(app.store.entries().is_empty());
+
+        let err = app.relocate_scope("weird", &weird).unwrap_err().to_string();
+        assert!(err.contains("control character"), "err was: {err}");
+        assert!(app.scopes.scopes().is_empty());
     }
 
     #[test]

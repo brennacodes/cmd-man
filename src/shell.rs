@@ -11,7 +11,7 @@ use wait_timeout::ChildExt;
 
 use crate::model::{Entry, Kind};
 use crate::paths::{self, Paths, home_dir};
-use crate::scopes::{Scope, ScopeRegistry, path_contains};
+use crate::scopes::{Scope, ScopeRegistry, one_line, path_contains};
 
 /// A supported interactive shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +149,13 @@ fn render_scope_block(
     let n = index + 1;
     let dir = resolved_path_of(scope);
 
-    let mut out = format!("# scope: {} ({})\n", scope.id, scope.path);
+    // The comment is the one place a registry value reaches the file unquoted,
+    // so it is flattened to a single line before it gets there.
+    let mut out = format!(
+        "# scope: {} ({})\n",
+        one_line(&scope.id),
+        one_line(&scope.path)
+    );
     out.push_str(&format!(
         "_cmdman_dir_{n}={}\n",
         single_quote(&dir.display().to_string())
@@ -1132,6 +1138,42 @@ mod tests {
         for (shell, bin) in [(Shell::Zsh, "zsh"), (Shell::Bash, "bash")] {
             assert_parses(bin, &render(shell, &entries, &scopes));
         }
+    }
+
+    #[test]
+    fn a_scope_that_could_inject_shell_code_reaches_neither_file() {
+        let injected_id = "api\nalias pwned='echo PWNED'\nfoo";
+        let injected_path = "/w/zz\nalias pwned='echo PWNED'\n#";
+        let scopes = reg(&[
+            ("ok", "/w/ok"),
+            (injected_id, "/w/one"),
+            ("two", injected_path),
+        ]);
+        let entries = vec![
+            scoped("dep", "echo ok", "ok"),
+            scoped("dep", "echo one", injected_id),
+            scoped("dep", "echo two", "two"),
+        ];
+        for (shell, bin) in [(Shell::Zsh, "zsh"), (Shell::Bash, "bash")] {
+            let out = render(shell, &entries, &scopes);
+            assert!(!out.contains("alias pwned"), "{bin} file was: {out}");
+            assert_parses(bin, &out);
+        }
+    }
+
+    #[test]
+    fn a_scope_comment_is_flattened_onto_one_line() {
+        let scope = Scope {
+            id: "a\nb".into(),
+            path: "/w/c\nd".into(),
+            created_at: "t".into(),
+        };
+        let entry = scoped("dep", "echo dep", "a\nb");
+        let block = render_scope_block(&[(&scope, vec![&entry])], 0, &HashMap::new());
+        assert!(
+            block.starts_with("# scope: a b (/w/c d)\n"),
+            "block was: {block}"
+        );
     }
 
     /// Syntax-check generated text with a real shell, skipping when that shell
