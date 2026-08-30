@@ -3,13 +3,14 @@
 use std::io::{IsTerminal, Write};
 
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::app::{App, now_timestamp};
 use crate::backup;
 use crate::capture;
 use crate::model::{Entry, EntryKey, Kind};
 use crate::paths::Paths;
+use crate::scopes::Placement;
 use crate::search::Filter;
 use crate::shell::{self, Shell};
 
@@ -69,6 +70,7 @@ enum Command {
 }
 
 #[derive(Args)]
+#[command(group = ArgGroup::new("placement").multiple(false))]
 struct AddArgs {
     /// The alias the user will type (e.g. gitsw).
     name: String,
@@ -91,6 +93,15 @@ struct AddArgs {
     /// Do not auto-fill description/usage/options/examples from --help.
     #[arg(long)]
     no_help: bool,
+    /// Place the entry in an existing scope by id.
+    #[arg(long, group = "placement")]
+    scope: Option<String>,
+    /// Scope the entry to this directory, creating a scope if needed.
+    #[arg(long, group = "placement")]
+    here: bool,
+    /// Force a global entry regardless of the configured default.
+    #[arg(long, group = "placement")]
+    global: bool,
 }
 
 #[derive(Args)]
@@ -204,12 +215,29 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         entry.description = prompt_required("Description")?;
     }
 
-    app.add(entry)?;
-    println!("Added '{}'.", args.name);
+    let placement = if args.here {
+        Placement::Here
+    } else if args.global {
+        Placement::Global
+    } else if let Some(id) = args.scope {
+        Placement::Scope(id)
+    } else {
+        Placement::Default
+    };
+
+    let key = app.add(entry, &placement)?;
+    match &key.scope {
+        Some(_) => println!(
+            "Added '{}' scoped to {}.",
+            key.name,
+            app.placement_label(&key)
+        ),
+        None => println!("Added '{}'.", key.name),
+    }
     print_reload_hint(&app);
 
     if args.capture {
-        do_capture(&mut app, &args.name, false)?;
+        do_capture(&mut app, &key, false)?;
     }
     Ok(())
 }
@@ -249,7 +277,7 @@ fn cmd_new() -> Result<()> {
     println!("Reading help for the command...");
     app.fill_from_help(&mut entry);
 
-    app.add(entry)?;
+    app.add(entry, &Placement::Default)?;
     println!("Added '{name}'.");
     print_reload_hint(&app);
     Ok(())
@@ -348,20 +376,20 @@ fn cmd_rm(name: &str) -> Result<()> {
 
 fn cmd_capture(name: &str, yes: bool) -> Result<()> {
     let mut app = load_app()?;
-    do_capture(&mut app, name, yes)
+    do_capture(&mut app, &EntryKey::global(name), yes)
 }
 
-fn do_capture(app: &mut App, name: &str, yes: bool) -> Result<()> {
-    let key = EntryKey::global(name);
+fn do_capture(app: &mut App, key: &EntryKey, yes: bool) -> Result<()> {
+    let label = key.label();
     let entry = app
         .store
-        .find(&key)
+        .find(key)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no entry '{}'", key.label()))?;
+        .ok_or_else(|| anyhow::anyhow!("no entry '{label}'"))?;
 
     let assessment = app.assess(&entry);
     if assessment.is_blocked() {
-        println!("Capture is disabled for '{name}'.");
+        println!("Capture is disabled for '{label}'.");
         return Ok(());
     }
     if assessment.needs_confirmation() && !yes {
@@ -378,9 +406,9 @@ fn do_capture(app: &mut App, name: &str, yes: bool) -> Result<()> {
             println!("{intel}");
         }
         if !std::io::stdin().is_terminal() {
-            bail!("'{name}' needs confirmation; re-run with --yes to capture");
+            bail!("'{label}' needs confirmation; re-run with --yes to capture");
         }
-        if !confirm(&format!("Run '{name}' to capture output?")) {
+        if !confirm(&format!("Run '{label}' to capture output?")) {
             println!("Skipped.");
             return Ok(());
         }
@@ -392,11 +420,11 @@ fn do_capture(app: &mut App, name: &str, yes: bool) -> Result<()> {
     }
     println!("Captured via {} backend.", result.backend);
     app.record_capture(
-        &key,
+        key,
         result.output.trim().to_string(),
         assessment.destructive,
     )?;
-    println!("Saved example output for '{name}'.");
+    println!("Saved example output for '{label}'.");
     Ok(())
 }
 

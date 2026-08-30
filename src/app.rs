@@ -10,8 +10,8 @@ use time::format_description::well_known::Rfc3339;
 use crate::capture::{self, Assessment, CaptureResult};
 use crate::config::Config;
 use crate::model::{CapturePolicy, Entry, EntryKey};
-use crate::paths::Paths;
-use crate::scopes::ScopeRegistry;
+use crate::paths::{self, Paths};
+use crate::scopes::{self, Placement, ScopeRegistry, Target};
 use crate::search::{Filter, search};
 use crate::shell;
 use crate::store::Store;
@@ -26,6 +26,10 @@ pub struct App {
     /// than a `current_dir()` call at each use site so placement, selection,
     /// and filtering stay testable without mutating process state.
     pub cwd: PathBuf,
+    /// The home directory scope walks stop at. A field for the same reason
+    /// `cwd` is one: a test can point it at its own temporary tree instead of
+    /// depending on where the real home happens to be.
+    pub home: Option<PathBuf>,
     /// Messages worth showing the user once, collected while loading state.
     pub notices: Vec<String>,
 }
@@ -43,6 +47,7 @@ impl App {
             store,
             scopes,
             cwd: process_cwd(),
+            home: paths::home_dir(),
             notices: Vec::new(),
         };
         Ok(app.finish_load())
@@ -89,6 +94,7 @@ impl App {
             store,
             scopes: ScopeRegistry::default(),
             cwd: process_cwd(),
+            home: paths::home_dir(),
             notices: Vec::new(),
         }
     }
@@ -102,6 +108,12 @@ impl App {
     /// Replace the working directory scoping is resolved against.
     pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
         self.cwd = cwd;
+        self
+    }
+
+    /// Replace the home directory scope walks stop at.
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.home = Some(home);
         self
     }
 
@@ -127,10 +139,57 @@ impl App {
         )
     }
 
-    /// Add an entry and persist.
-    pub fn add(&mut self, entry: Entry) -> Result<()> {
+    /// Resolve a placement against the configured default, the registry, and
+    /// the app's working directory, without creating anything.
+    pub fn resolve_target(&self, placement: &Placement) -> Result<Target> {
+        let (mode, _) = self.config.scope.resolve();
+        scopes::resolve_placement(
+            placement,
+            mode,
+            &self.scopes,
+            &self.cwd,
+            self.home.as_deref(),
+        )
+    }
+
+    /// How a resolved key reads to the user: `global`, or the scope id
+    /// followed by its directory.
+    pub fn placement_label(&self, key: &EntryKey) -> String {
+        let Some(id) = &key.scope else {
+            return "global".to_string();
+        };
+        match self.scopes.resolved_path(id) {
+            Some(dir) => format!("{id} ({})", paths::portable_path(&dir)),
+            None => id.clone(),
+        }
+    }
+
+    /// Add an entry at the requested placement and persist, returning the key
+    /// it landed under. The only place a scope is created: the store accepts
+    /// the entry first, so a rejected entry leaves no scope behind.
+    pub fn add(&mut self, mut entry: Entry, placement: &Placement) -> Result<EntryKey> {
+        let pending = match self.resolve_target(placement)? {
+            Target::Global => {
+                entry.scope = None;
+                None
+            }
+            Target::Existing(id) => {
+                entry.scope = Some(id);
+                None
+            }
+            Target::NewAt(dir) => {
+                let scope = self.scopes.plan_create(&dir, &now_timestamp());
+                entry.scope = Some(scope.id.clone());
+                Some(scope)
+            }
+        };
+        let key = EntryKey::of(&entry);
         self.store.add(entry)?;
-        self.persist()
+        if let Some(scope) = pending {
+            self.scopes.insert(scope);
+        }
+        self.persist()?;
+        Ok(key)
     }
 
     /// Update an entry (matched by `key`) and persist.
@@ -210,9 +269,17 @@ impl App {
     }
 }
 
-/// The process working directory, falling back to `.` when it is unreadable.
+/// The working directory as the shell names it. Shells keep `PWD` logical
+/// across a `cd` through a symlink while `current_dir` reports the physical
+/// path, and the generated dispatcher matches `$PWD`, so the logical form is
+/// the one scope paths have to be stored and compared in. `PWD` is only
+/// trusted when it still names the directory the process is actually in.
 fn process_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let physical = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match std::env::var_os("PWD").map(PathBuf::from) {
+        Some(logical) if logical.is_absolute() && scopes::same_dir(&logical, &physical) => logical,
+        _ => physical,
+    }
 }
 
 /// An RFC 3339 timestamp for the current instant.
@@ -234,11 +301,28 @@ mod tests {
         (dir, app)
     }
 
+    /// An app rooted entirely in `dir`, including its home, so scope walks stop
+    /// at the temporary tree instead of climbing toward wherever `TMPDIR`
+    /// points. Canonicalized because `with_cwd` callers canonicalize too and
+    /// the walk compares paths exactly.
+    fn test_app_with(dir: &tempfile::TempDir, config: Config) -> App {
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        App::with(paths, config, Store::default()).with_home(dir.path().canonicalize().unwrap())
+    }
+
+    fn test_app(dir: &tempfile::TempDir) -> App {
+        test_app_with(dir, Config::default())
+    }
+
     #[test]
     fn add_persists_store_and_regenerates_shell() {
         let (dir, mut app) = temp_app();
-        app.add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"))
-            .unwrap();
+        app.add(
+            Entry::new("gitsw", Kind::Alias, "git switch", "switch"),
+            &Placement::Global,
+        )
+        .unwrap();
 
         assert!(dir.path().join("categories/general.toml").exists());
         let zsh = std::fs::read_to_string(dir.path().join("shell/cmd-man.zsh")).unwrap();
@@ -248,8 +332,11 @@ mod tests {
     #[test]
     fn remove_updates_generated_files() {
         let (dir, mut app) = temp_app();
-        app.add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"))
-            .unwrap();
+        app.add(
+            Entry::new("gitsw", Kind::Alias, "git switch", "switch"),
+            &Placement::Global,
+        )
+        .unwrap();
         app.remove(&EntryKey::global("gitsw")).unwrap();
         let zsh = std::fs::read_to_string(dir.path().join("shell/cmd-man.zsh")).unwrap();
         assert!(!zsh.contains("gitsw"));
@@ -258,8 +345,11 @@ mod tests {
     #[test]
     fn record_capture_sets_output_and_flags() {
         let (_dir, mut app) = temp_app();
-        app.add(Entry::new("gitsw", Kind::Alias, "git switch", "switch"))
-            .unwrap();
+        app.add(
+            Entry::new("gitsw", Kind::Alias, "git switch", "switch"),
+            &Placement::Global,
+        )
+        .unwrap();
         app.record_capture(
             &EntryKey::global("gitsw"),
             "Switched to branch 'main'".into(),
@@ -270,6 +360,123 @@ mod tests {
         assert_eq!(e.example_output, "Switched to branch 'main'");
         assert!(e.destructive);
         assert_eq!(e.capture_policy, CapturePolicy::Confirm);
+    }
+
+    #[test]
+    fn add_here_creates_a_scope_and_returns_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work/api");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut app = test_app(&dir).with_cwd(cwd.canonicalize().unwrap());
+
+        let key = app
+            .add(
+                Entry::new("ll", Kind::Alias, "ls -lah", "d"),
+                &Placement::Here,
+            )
+            .unwrap();
+
+        assert_eq!(key.scope.as_deref(), Some("api"));
+        assert_eq!(app.scopes.scopes().len(), 1);
+        assert_eq!(app.store.find(&key).unwrap().command, "ls -lah");
+    }
+
+    #[test]
+    fn add_here_anchors_at_the_enclosing_repo_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work/api");
+        let cwd = root.join("src/deep");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let mut app = test_app(&dir).with_cwd(cwd.canonicalize().unwrap());
+
+        let key = app
+            .add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Here)
+            .unwrap();
+
+        assert_eq!(key.scope.as_deref(), Some("api"));
+        assert_eq!(
+            app.scopes.resolved_path("api").unwrap(),
+            root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn add_reuses_an_existing_scope_on_the_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work/api");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut app = test_app(&dir).with_cwd(cwd.canonicalize().unwrap());
+
+        app.add(
+            Entry::new("a", Kind::Alias, "echo a", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+        app.add(
+            Entry::new("b", Kind::Alias, "echo b", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        assert_eq!(app.scopes.scopes().len(), 1);
+    }
+
+    #[test]
+    fn a_rejected_entry_registers_no_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work/api");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut app = test_app(&dir).with_cwd(cwd.canonicalize().unwrap());
+        app.add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Here)
+            .unwrap();
+        let before = app.scopes.scopes().len();
+
+        assert!(
+            app.add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Here)
+                .is_err()
+        );
+        assert_eq!(app.scopes.scopes().len(), before);
+    }
+
+    #[test]
+    fn add_global_leaves_the_registry_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+
+        let key = app
+            .add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Global)
+            .unwrap();
+
+        assert_eq!(key, EntryKey::global("ll"));
+        assert!(app.scopes.is_empty());
+    }
+
+    #[test]
+    fn placement_label_names_the_scope_and_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let app =
+            test_app(&dir).with_scopes(ScopeRegistry::from_scopes(vec![crate::scopes::Scope {
+                id: "api".into(),
+                path: "$HOME/work/api".into(),
+                created_at: "t".into(),
+            }]));
+
+        assert_eq!(app.placement_label(&EntryKey::global("ll")), "global");
+        assert_eq!(
+            app.placement_label(&EntryKey {
+                scope: Some("api".into()),
+                name: "ll".into(),
+            }),
+            "api ($HOME/work/api)"
+        );
+        assert_eq!(
+            app.placement_label(&EntryKey {
+                scope: Some("gone".into()),
+                name: "ll".into(),
+            }),
+            "gone"
+        );
     }
 
     #[test]

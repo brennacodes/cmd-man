@@ -16,6 +16,14 @@ fn cmd(home: &TempDir) -> Command {
     c
 }
 
+/// [`cmd`] run from `dir`, with `PWD` exported the way a shell would so the
+/// binary sees the same logical directory it is standing in.
+fn cmd_in(home: &TempDir, dir: &std::path::Path) -> Command {
+    let mut c = cmd(home);
+    c.current_dir(dir).env("PWD", dir);
+    c
+}
+
 fn store_dir(home: &TempDir) -> std::path::PathBuf {
     home.path().join("store")
 }
@@ -248,4 +256,173 @@ fn an_entry_in_an_unknown_scope_warns_and_is_not_rendered() {
     cmd(&home).args(["reload"]).assert().success();
     let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
     assert!(!zsh.contains("echo ok"), "zsh was: {zsh}");
+}
+
+#[test]
+fn add_here_scopes_the_entry_and_reports_it() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd_in(&home, &api)
+        .args([
+            "add",
+            "ll",
+            "-c",
+            "ls -lah",
+            "--desc",
+            "long list",
+            "--here",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Added 'll' scoped to api ($HOME/work/api)",
+        ));
+
+    let scopes = std::fs::read_to_string(store_dir(&home).join("scopes.toml")).unwrap();
+    assert!(scopes.contains("id = \"api\""), "scopes were: {scopes}");
+    // Stored $HOME-relative so the registry survives a move to another machine.
+    assert!(
+        scopes.contains("path = \"$HOME/work/api\""),
+        "scopes were: {scopes}"
+    );
+}
+
+#[test]
+fn add_here_with_capture_records_output_on_the_scoped_entry() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd(&home)
+        .args(["add", "gg", "-c", "echo global-one", "--desc", "g"])
+        .assert()
+        .success();
+    cmd_in(&home, &api)
+        .args([
+            "add",
+            "gg",
+            "-c",
+            "echo scoped-one",
+            "--desc",
+            "s",
+            "--here",
+            "--capture",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Saved example output for 'gg (api)'",
+        ));
+
+    let entries =
+        std::fs::read_to_string(store_dir(&home).join("categories/general.toml")).unwrap();
+    assert!(
+        entries.contains("example_output = \"scoped-one\""),
+        "entries were: {entries}"
+    );
+    assert!(
+        !entries.contains("example_output = \"global-one\""),
+        "the global entry was mutated: {entries}"
+    );
+}
+
+#[test]
+fn add_here_follows_a_symlinked_working_directory() {
+    let home = TempDir::new().unwrap();
+    let real = home.path().join("actual/proj");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = home.path().join("proj");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    cmd_in(&home, &link)
+        .args(["add", "dep", "-c", "make deploy", "--desc", "d", "--here"])
+        .assert()
+        .success();
+
+    let scopes = std::fs::read_to_string(store_dir(&home).join("scopes.toml")).unwrap();
+    assert!(
+        scopes.contains("path = \"$HOME/proj\""),
+        "scopes were: {scopes}"
+    );
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(
+        zsh.contains(&format!("'{}'", link.display())),
+        "zsh was: {zsh}"
+    );
+}
+
+#[test]
+fn the_same_name_can_exist_globally_and_in_a_scope() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    cmd(&home)
+        .args(["add", "ll", "-c", "ls -la", "--desc", "g"])
+        .assert()
+        .success();
+    cmd_in(&home, &api)
+        .args(["add", "ll", "-c", "ls -lah", "--desc", "s", "--here"])
+        .assert()
+        .success();
+    cmd_in(&home, &api)
+        .args(["add", "ll", "-c", "ls -lahG", "--desc", "s2", "--here"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn add_with_no_flag_stays_global_inside_a_git_repo() {
+    let home = TempDir::new().unwrap();
+    let proj = home.path().join("proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+
+    cmd_in(&home, &proj)
+        .args(["add", "ll", "-c", "ls -la", "--desc", "d"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Added 'll'"))
+        .stdout(predicate::str::contains("scoped to").not());
+}
+
+#[test]
+fn repo_mode_scopes_to_the_repo_root() {
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(store_dir(&home)).unwrap();
+    std::fs::write(
+        store_dir(&home).join("config.toml"),
+        "[scope]\ndefault = \"repo\"\n",
+    )
+    .unwrap();
+    let proj = home.path().join("proj");
+    let deep = proj.join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+
+    cmd_in(&home, &deep)
+        .args(["add", "ll", "-c", "ls -la", "--desc", "d"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scoped to proj"));
+}
+
+#[test]
+fn repo_mode_does_not_scope_to_home() {
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(store_dir(&home)).unwrap();
+    std::fs::write(
+        store_dir(&home).join("config.toml"),
+        "[scope]\ndefault = \"repo\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join(".git")).unwrap();
+
+    cmd_in(&home, home.path())
+        .args(["add", "ll", "-c", "ls -la", "--desc", "d"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scoped to").not());
 }

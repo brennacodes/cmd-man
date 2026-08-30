@@ -314,9 +314,7 @@ pub fn resolve_placement(
                 let Some(root) = repo_root(cwd, home) else {
                     return Ok(Target::Global);
                 };
-                let root = canonical(&root);
-                if home.map(canonical).as_deref() == Some(root.as_path()) || root.parent().is_none()
-                {
+                if home.is_some_and(|h| same_dir(h, &root)) || root.parent().is_none() {
                     return Ok(Target::Global);
                 }
                 Ok(target_for_dir(registry, &root))
@@ -342,9 +340,11 @@ pub fn repo_root(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// The directory `--here` means: the enclosing repo root when there is one,
-/// otherwise the working directory itself.
+/// otherwise the working directory itself. Never canonicalized: the generated
+/// dispatcher matches the shell's logical `$PWD`, so a directory reached
+/// through a symlink has to be stored the way the shell names it.
 fn anchor(cwd: &Path, home: Option<&Path>) -> PathBuf {
-    canonical(&repo_root(cwd, home).unwrap_or_else(|| cwd.to_path_buf()))
+    repo_root(cwd, home).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn target_for_dir(registry: &ScopeRegistry, dir: &Path) -> Target {
@@ -354,8 +354,13 @@ fn target_for_dir(registry: &ScopeRegistry, dir: &Path) -> Target {
     }
 }
 
-/// Canonicalize where possible so `/var` and `/private/var` compare equal on
-/// macOS, and leave a directory that does not exist usable rather than fatal.
+/// Whether two paths name the same directory, resolving symlinks so `/var` and
+/// `/private/var` compare equal on macOS. A path that does not exist compares
+/// as written rather than being an error.
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || canonical(a) == canonical(b)
+}
+
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -550,7 +555,7 @@ mod tests {
         let reg = ScopeRegistry::default();
         let target =
             resolve_placement(&Placement::Default, ScopeDefault::Repo, &reg, &deep, None).unwrap();
-        assert_eq!(target, Target::NewAt(root.canonicalize().unwrap()));
+        assert_eq!(target, Target::NewAt(root));
     }
 
     #[test]
@@ -592,17 +597,16 @@ mod tests {
         let deep = root.join("src");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let canonical = root.canonicalize().unwrap();
 
         let reg = ScopeRegistry::default();
         assert_eq!(
             resolve_placement(&Placement::Here, ScopeDefault::Global, &reg, &deep, None).unwrap(),
-            Target::NewAt(canonical.clone())
+            Target::NewAt(root.clone())
         );
 
         let reg = ScopeRegistry::from_scopes(vec![Scope {
             id: "proj".into(),
-            path: canonical.display().to_string(),
+            path: root.display().to_string(),
             created_at: "t".into(),
         }]);
         assert_eq!(
@@ -624,7 +628,48 @@ mod tests {
                 Some(dir.path())
             )
             .unwrap(),
-            Target::NewAt(dir.path().canonicalize().unwrap())
+            Target::NewAt(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn placement_keeps_the_symlinked_path_the_shell_would_report() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("actual/proj");
+        std::fs::create_dir_all(real.join(".git")).unwrap();
+        let link = dir.path().join("proj");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let reg = ScopeRegistry::default();
+        assert_eq!(
+            resolve_placement(&Placement::Here, ScopeDefault::Global, &reg, &link, None).unwrap(),
+            Target::NewAt(link.clone())
+        );
+        assert_eq!(
+            resolve_placement(&Placement::Default, ScopeDefault::Repo, &reg, &link, None).unwrap(),
+            Target::NewAt(link)
+        );
+    }
+
+    #[test]
+    fn repo_mode_home_guard_sees_through_a_symlinked_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("actual/home");
+        std::fs::create_dir_all(real.join(".git")).unwrap();
+        let link = dir.path().join("home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let reg = ScopeRegistry::default();
+        assert_eq!(
+            resolve_placement(
+                &Placement::Default,
+                ScopeDefault::Repo,
+                &reg,
+                &link,
+                Some(&real)
+            )
+            .unwrap(),
+            Target::Global
         );
     }
 

@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use crate::app::{App, now_timestamp};
 use crate::backup;
 use crate::model::EntryKey;
+use crate::scopes::Placement;
 
 use form::Form;
 use state::{Action, ConfirmKind, Mode, UiState};
@@ -256,7 +257,7 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
             let label = EntryKey::of(&entry).label();
             let result = match &original {
                 Some(old) => app.update(old, entry),
-                None => app.add(entry),
+                None => app.add(entry, &Placement::Default).map(|_| ()),
             };
             match result {
                 Ok(()) => {
@@ -437,7 +438,7 @@ mod tests {
         let mut state = UiState::new(vec![]);
         let mut scoped = Entry::new("ll", Kind::Alias, "ls -la", "list");
         scoped.scope = Some("api".into());
-        app.add(scoped.clone()).unwrap();
+        app.store.add(scoped.clone()).unwrap();
 
         let form = Form::edit(&scoped);
         let original = form.original.clone();
