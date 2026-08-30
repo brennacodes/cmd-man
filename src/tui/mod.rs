@@ -20,7 +20,7 @@ pub fn run() -> Result<()> {
     let mut app = App::load()?;
     // Pull the latest at launch; mid-session mutations sync via App::persist.
     backup::spawn_sync(&app.paths);
-    let mut state = UiState::new(app.store.entries().to_vec());
+    let mut state = UiState::new(&app);
     let mut form: Option<Form> = None;
 
     let mut terminal = ratatui::init();
@@ -171,6 +171,7 @@ fn handle_browse_key(state: &mut UiState, key: KeyEvent) -> Option<Action> {
         KeyCode::PageUp => state.page_up(10),
         KeyCode::Tab => state.cycle_kind(),
         KeyCode::Char('g') => state.cycle_category(),
+        KeyCode::Char('s') => return Some(Action::CycleScope),
         KeyCode::Char('?') => state.mode = Mode::Help,
         KeyCode::Char('a') => return Some(Action::open_add()),
         KeyCode::Char('e') => return Some(Action::open_edit()),
@@ -229,6 +230,7 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
     match action {
         // Quit and OpenForm are handled in the event loop before reaching here.
         Action::Quit | Action::OpenForm { .. } => {}
+        Action::CycleScope => state.cycle_scope(app),
         Action::Reload => match app.regenerate_shells() {
             Ok(()) => state.set_status("Regenerated shell files"),
             Err(e) => state.set_status(format!("Reload failed: {e}")),
@@ -336,9 +338,9 @@ fn perform_capture(app: &mut App, state: &mut UiState, key: &EntryKey, destructi
     }
 }
 
-/// Rebuild the view from the App's current store, opening a form if requested.
+/// Rebuild the view from the App's current store and scope registry.
 fn refresh(app: &App, state: &mut UiState) {
-    state.set_entries(app.store.entries().to_vec());
+    state.set_entries(app);
 }
 
 /// Actions that open a form need the current selection, so they are resolved in
@@ -359,11 +361,27 @@ mod tests {
     use crate::model::{Entry, Kind};
     use crate::paths::Paths;
     use crate::scopes::ScopeRegistry;
+    use crate::search::ScopeFilter;
     use crate::store::Store;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// A UI state over `entries` with no scopes registered. Nothing built this
+    /// way writes, so the root path is never touched.
+    fn state_over(entries: Vec<Entry>) -> UiState {
+        let mut store = Store::default();
+        for entry in entries {
+            store.add(entry).unwrap();
+        }
+        UiState::new(&App::with(
+            Paths::with_root(PathBuf::from("/cmd-man")),
+            Config::default(),
+            store,
+        ))
     }
 
     /// An app rooted entirely in `dir`, including its home, so scope walks stop
@@ -381,7 +399,7 @@ mod tests {
 
     #[test]
     fn browse_quit_keys() {
-        let mut state = UiState::new(vec![]);
+        let mut state = state_over(vec![]);
         assert_eq!(
             handle_key(&mut state, key(KeyCode::Char('q'))),
             Some(Action::Quit)
@@ -390,7 +408,7 @@ mod tests {
 
     #[test]
     fn slash_enters_search_mode() {
-        let mut state = UiState::new(vec![]);
+        let mut state = state_over(vec![]);
         handle_key(&mut state, key(KeyCode::Char('/')));
         assert_eq!(state.mode, Mode::Search);
         handle_key(&mut state, key(KeyCode::Char('x')));
@@ -401,7 +419,7 @@ mod tests {
 
     #[test]
     fn delete_flow_confirms_then_removes() {
-        let mut state = UiState::new(vec![Entry::new("gitsw", Kind::Alias, "git switch", "s")]);
+        let mut state = state_over(vec![Entry::new("gitsw", Kind::Alias, "git switch", "s")]);
         let none = handle_key(&mut state, key(KeyCode::Char('d')));
         assert!(none.is_none());
         assert!(matches!(state.mode, Mode::Confirm { .. }));
@@ -411,11 +429,33 @@ mod tests {
 
     #[test]
     fn confirm_no_cancels() {
-        let mut state = UiState::new(vec![Entry::new("gitsw", Kind::Alias, "git switch", "s")]);
+        let mut state = state_over(vec![Entry::new("gitsw", Kind::Alias, "git switch", "s")]);
         handle_key(&mut state, key(KeyCode::Char('d')));
         let action = handle_key(&mut state, key(KeyCode::Char('n')));
         assert!(action.is_none());
         assert_eq!(state.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn the_s_key_cycles_the_scope_filter() {
+        let dir = TempDir::new().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app_with(&dir, Config::default()).with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("dep", Kind::Alias, "make deploy", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        let mut state = UiState::new(&app);
+        let action = handle_key(&mut state, key(KeyCode::Char('s'))).unwrap();
+        assert_eq!(action, Action::CycleScope);
+        execute(action, &mut app, &mut state).unwrap();
+        assert_eq!(
+            state.scope_filter(),
+            &ScopeFilter::ActiveIn(vec!["api".to_string()])
+        );
     }
 
     #[test]
@@ -480,7 +520,7 @@ mod tests {
         let api = dir.path().join("work/api");
         std::fs::create_dir_all(&api).unwrap();
         let mut app = test_app_with(&dir, Config::default()).with_cwd(api.canonicalize().unwrap());
-        let mut state = UiState::new(vec![]);
+        let mut state = state_over(vec![]);
 
         let mut form = typed_add_form("here");
         let action = handle_form_key(&mut form, key(KeyCode::Enter)).unwrap();
@@ -497,7 +537,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(dir.path().to_path_buf());
         let mut app = App::with(paths, Config::default(), Store::default());
-        let mut state = UiState::new(vec![]);
+        let mut state = state_over(vec![]);
         let entry = Entry::new("gitsw", Kind::Alias, "git switch", "switch");
         execute(
             Action::Submit {
@@ -519,7 +559,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::with_root(dir.path().to_path_buf());
         let mut app = App::with(paths, Config::default(), Store::default());
-        let mut state = UiState::new(vec![]);
+        let mut state = state_over(vec![]);
         let mut scoped = Entry::new("ll", Kind::Alias, "ls -la", "list");
         scoped.scope = Some("api".into());
         app.store.add(scoped.clone()).unwrap();
@@ -549,7 +589,7 @@ mod tests {
         let api = dir.path().join("work/api");
         std::fs::create_dir_all(&api).unwrap();
         let mut app = test_app_with(&dir, Config::default()).with_cwd(api.canonicalize().unwrap());
-        let mut state = UiState::new(vec![]);
+        let mut state = state_over(vec![]);
         let global = Entry::new("ll", Kind::Alias, "ls -la", "list");
         app.store.add(global.clone()).unwrap();
 
@@ -596,7 +636,7 @@ mod tests {
 
         // Built after the CLI app has persisted, so it sees the same registry.
         let mut tui_app = test_app_with(&dir, config).with_cwd(cwd);
-        let mut state = UiState::new(tui_app.store.entries().to_vec());
+        let mut state = UiState::new(&tui_app);
         execute(
             Action::Submit {
                 original: None,

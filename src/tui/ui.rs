@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::model::Kind;
+use crate::model::{Entry, Kind};
 
 use super::form::Form;
 use super::state::{Mode, UiState};
@@ -91,14 +91,21 @@ fn draw_list(frame: &mut Frame, area: Rect, state: &UiState) {
         .map(|e| {
             // No explicit foreground so the reversed selection bar stays clean
             // and readable on any theme.
-            let mut spans = vec![
-                Span::styled(format!("{:<16}", e.name), header_style()),
-                Span::styled(format!("[{}]", e.kind), label_style()),
-            ];
+            let mut spans = vec![Span::styled(format!("{:<16}", e.name), header_style())];
+            if let Some(scope) = &e.scope {
+                spans.push(Span::styled(format!("[{scope}] "), label_style()));
+            }
+            spans.push(Span::styled(format!("[{}]", e.kind), label_style()));
             if e.destructive {
                 spans.push(Span::styled("  !", Style::default().fg(WARN)));
             }
-            ListItem::new(Line::from(spans))
+            let item = ListItem::new(Line::from(spans));
+            // Dimmed means defined but not live in this directory.
+            if state.is_active(e) {
+                item
+            } else {
+                item.style(Style::default().add_modifier(Modifier::DIM))
+            }
         })
         .collect();
 
@@ -135,6 +142,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &UiState) {
             ),
         ]),
         field_line("category", &entry.category),
+        field_line("scope", &scope_label(state, entry)),
     ];
     if !entry.tags.is_empty() {
         lines.push(field_line("tags", &entry.tags.join(", ")));
@@ -208,7 +216,7 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &UiState) {
     let hints = match state.mode {
         Mode::Search => "type to filter  Enter/Esc: done",
         _ => {
-            "/ search  j/k move  Tab kind  g category  a add  e edit  d delete  c capture  r reload  b backup  ? help  q quit"
+            "/ search  j/k move  Tab kind  g category  s scope  a add  e edit  d delete  c capture  r reload  b backup  ? help  q quit"
         }
     };
     let line = Line::from(vec![
@@ -253,6 +261,7 @@ fn draw_help(frame: &mut Frame) {
         help_row("PgUp / PgDn", "page through the list"),
         help_row("Tab", "cycle kind filter (all/alias/function)"),
         help_row("g", "cycle category filter"),
+        help_row("s", "cycle scope filter"),
         help_row("a", "add a new entry"),
         help_row("e", "edit the selected entry"),
         help_row("d", "delete the selected entry"),
@@ -382,6 +391,18 @@ fn kind_color(kind: Kind) -> Color {
     }
 }
 
+/// How the detail pane names an entry's scope: `global`, or the id with the
+/// directory it points at.
+fn scope_label(state: &UiState, entry: &Entry) -> String {
+    let Some(id) = &entry.scope else {
+        return "global".to_string();
+    };
+    match state.scope_path(id) {
+        Some(path) => format!("{id} ({path})"),
+        None => format!("{id} (unknown scope)"),
+    }
+}
+
 fn field_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<10}"), label_style()),
@@ -422,17 +443,20 @@ fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
+    use crate::config::Config;
     use crate::model::Entry;
+    use crate::paths::Paths;
+    use crate::scopes::{Scope, ScopeRegistry};
+    use crate::store::Store;
     use crate::tui::form::SCOPE;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::path::PathBuf;
 
-    /// The form popup rendered into a terminal of the given size, one string
-    /// per row.
-    fn render_form(form: &Form, width: u16, height: u16) -> Vec<String> {
-        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-        term.draw(|frame| draw_form(frame, form)).unwrap();
-        let buffer = term.backend().buffer().clone();
+    /// One string per row of a rendered buffer.
+    fn rows(buffer: &Buffer) -> Vec<String> {
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -440,6 +464,115 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The form popup rendered into a terminal of the given size, one string
+    /// per row.
+    fn render_form(form: &Form, width: u16, height: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| draw_form(frame, form)).unwrap();
+        rows(term.backend().buffer())
+    }
+
+    /// A UI state holding one entry scoped to `api`, a directory the working
+    /// directory is outside of. Nothing here writes, so the root path is never
+    /// touched.
+    fn scoped_state() -> UiState {
+        let mut entry = Entry::new("dep", Kind::Alias, "make deploy", "deploy");
+        entry.scope = Some("api".into());
+        let mut store = Store::default();
+        store.add(entry).unwrap();
+        let mut scopes = ScopeRegistry::default();
+        scopes.insert(Scope {
+            id: "api".into(),
+            path: "~/work/api".into(),
+            created_at: String::new(),
+        });
+        let app = App::with(
+            Paths::with_root(PathBuf::from("/cmd-man")),
+            Config::default(),
+            store,
+        )
+        .with_scopes(scopes)
+        .with_cwd(PathBuf::from("/"));
+        UiState::new(&app)
+    }
+
+    /// The list pane rendered into a terminal of the given size.
+    fn render_list(state: &UiState, width: u16, height: u16) -> Buffer {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            draw_list(frame, area, state)
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// The detail pane rendered into a terminal of the given size.
+    fn render_detail(state: &UiState, width: u16, height: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            draw_detail(frame, area, state)
+        })
+        .unwrap();
+        rows(term.backend().buffer())
+    }
+
+    #[test]
+    fn a_scoped_entry_carries_its_scope_badge_in_the_list() {
+        let buffer = render_list(&scoped_state(), 40, 6);
+        let listed = rows(&buffer);
+        assert!(
+            listed.iter().any(|row| row.contains("[api]")),
+            "no scope badge in:\n{}",
+            listed.join("\n")
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_live_here_is_dimmed() {
+        let buffer = render_list(&scoped_state(), 40, 6);
+        let listed = rows(&buffer);
+        let row = listed
+            .iter()
+            .position(|row| row.contains("dep"))
+            .unwrap_or_else(|| panic!("no entry row in:\n{}", listed.join("\n")));
+        let y = u16::try_from(row).unwrap();
+        assert!(
+            (1..8).all(|x| buffer[(x, y)].style().add_modifier.contains(Modifier::DIM)),
+            "row {row} is not dimmed"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_names_the_scope_and_its_directory() {
+        let detail = render_detail(&scoped_state(), 60, 12);
+        assert!(
+            detail.iter().any(|row| row.contains("api (~/work/api)")),
+            "no scope row in:\n{}",
+            detail.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_calls_an_unscoped_entry_global() {
+        let mut store = Store::default();
+        store
+            .add(Entry::new("ll", Kind::Alias, "ls -lah", "list"))
+            .unwrap();
+        let app = App::with(
+            Paths::with_root(PathBuf::from("/cmd-man")),
+            Config::default(),
+            store,
+        );
+        let detail = render_detail(&UiState::new(&app), 60, 12);
+        assert!(
+            detail.iter().any(|row| row.contains("scope     global")),
+            "no scope row in:\n{}",
+            detail.join("\n")
+        );
     }
 
     #[test]
