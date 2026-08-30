@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use crate::app::{App, now_timestamp};
 use crate::backup;
 use crate::model::EntryKey;
+use crate::scopes::Placement;
 
 use form::Form;
 use state::{Action, ConfirmKind, Mode, UiState};
@@ -257,11 +258,7 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
                 app.fill_from_help(&mut entry);
             }
             let result = match &original {
-                Some(old) => {
-                    // Computed before `update` takes the entry.
-                    let updated = EntryKey::of(&entry);
-                    app.update(old, entry).map(|()| updated)
-                }
+                Some(old) => app.update(old, entry, requested_move(old, &placement)),
                 None => app.add(entry, &placement),
             };
             match result {
@@ -303,6 +300,19 @@ fn execute(action: Action, app: &mut App, state: &mut UiState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The move an edit form asks for, or `None` to leave the entry where it is.
+/// The scope field is seeded from the entry, so a placement naming the scope
+/// the entry is already in is not a move, and a blank field is the user saying
+/// nothing rather than asking for the configured default.
+fn requested_move<'a>(old: &EntryKey, placement: &'a Placement) -> Option<&'a Placement> {
+    match placement {
+        Placement::Default => None,
+        Placement::Global if old.scope.is_none() => None,
+        Placement::Scope(id) if old.scope.as_deref() == Some(id.as_str()) => None,
+        other => Some(other),
+    }
 }
 
 fn perform_capture(app: &mut App, state: &mut UiState, key: &EntryKey, destructive: bool) {
@@ -348,7 +358,7 @@ mod tests {
     use crate::config::Config;
     use crate::model::{Entry, Kind};
     use crate::paths::Paths;
-    use crate::scopes::{Placement, ScopeRegistry};
+    use crate::scopes::ScopeRegistry;
     use crate::store::Store;
     use tempfile::TempDir;
 
@@ -521,7 +531,7 @@ mod tests {
             Action::Submit {
                 original,
                 entry: Box::new(rebuilt),
-                placement: Placement::Default,
+                placement: form.placement(),
                 autofill: false,
             },
             &mut app,
@@ -531,6 +541,37 @@ mod tests {
 
         assert_eq!(app.store.entries().len(), 1);
         assert_eq!(app.store.entries()[0].scope, Some("api".to_string()));
+    }
+
+    #[test]
+    fn changing_the_scope_field_on_an_edit_form_moves_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app_with(&dir, Config::default()).with_cwd(api.canonicalize().unwrap());
+        let mut state = UiState::new(vec![]);
+        let global = Entry::new("ll", Kind::Alias, "ls -la", "list");
+        app.store.add(global.clone()).unwrap();
+
+        let mut form = Form::edit(&global);
+        form.fields[form::SCOPE].value = "here".into();
+        let original = form.original.clone();
+        let rebuilt = form.to_entry().unwrap();
+        execute(
+            Action::Submit {
+                original,
+                entry: Box::new(rebuilt),
+                placement: form.placement(),
+                autofill: false,
+            },
+            &mut app,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(app.store.entries().len(), 1);
+        assert_eq!(app.store.entries()[0].scope.as_deref(), Some("api"));
+        assert_eq!(state.status, "Saved 'll (api)'");
     }
 
     #[test]

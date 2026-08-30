@@ -133,6 +133,7 @@ impl SelectionArgs {
 }
 
 #[derive(Args)]
+#[command(group = ArgGroup::new("move").multiple(false))]
 struct EditArgs {
     name: String,
     #[arg(long, short = 'c')]
@@ -153,8 +154,29 @@ struct EditArgs {
     /// Do not auto-fill empty description/usage/options/examples from --help.
     #[arg(long)]
     no_help: bool,
+    /// Move the entry into this existing scope id.
+    #[arg(long = "move-to", value_name = "ID", group = "move")]
+    move_to: Option<String>,
+    /// Move the entry into this directory's scope, creating one if needed.
+    #[arg(long, group = "move")]
+    move_here: bool,
+    /// Move the entry out of its scope and make it global.
+    #[arg(long, group = "move")]
+    make_global: bool,
     #[command(flatten)]
     selection: SelectionArgs,
+}
+
+impl EditArgs {
+    /// The move the flags ask for, or `None` to keep the current scope.
+    fn placement(&self) -> Option<Placement> {
+        match (&self.move_to, self.move_here, self.make_global) {
+            (Some(id), _, _) => Some(Placement::Scope(id.clone())),
+            (None, true, _) => Some(Placement::Here),
+            (None, false, true) => Some(Placement::Global),
+            (None, false, false) => None,
+        }
+    }
 }
 
 /// Parse arguments and run the requested command (or the TUI).
@@ -375,6 +397,7 @@ fn cmd_list(category: Option<String>, kind: Option<String>) -> Result<()> {
 fn cmd_edit(args: EditArgs) -> Result<()> {
     let mut app = load_app()?;
     let key = app.resolve_key(&args.name, args.selection.selection())?;
+    let placement = args.placement();
     let mut entry = app
         .store
         .find(&key)
@@ -407,8 +430,8 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
         app.fill_from_help(&mut entry);
     }
 
-    app.update(&key, entry)?;
-    println!("Updated '{}'.", key.label());
+    let new_key = app.update(&key, entry, placement.as_ref())?;
+    println!("Updated '{}'.", new_key.label());
     print_reload_hint(&app);
     Ok(())
 }

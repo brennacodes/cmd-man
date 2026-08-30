@@ -258,10 +258,45 @@ impl App {
         Ok(key)
     }
 
-    /// Update an entry (matched by `key`) and persist.
-    pub fn update(&mut self, key: &EntryKey, entry: Entry) -> Result<()> {
+    /// Update an entry (matched by `key`) and persist, returning the key it
+    /// now lives under. A `placement` of `None` keeps the entry where it is.
+    /// The other place a scope is created, under the same rule as `add`: the
+    /// store accepts the entry first, so a rejected move leaves no scope
+    /// behind.
+    pub fn update(
+        &mut self,
+        key: &EntryKey,
+        mut entry: Entry,
+        placement: Option<&Placement>,
+    ) -> Result<EntryKey> {
+        let pending = match placement {
+            None => {
+                entry.scope = key.scope.clone();
+                None
+            }
+            Some(placement) => match self.resolve_target(placement)? {
+                Target::Global => {
+                    entry.scope = None;
+                    None
+                }
+                Target::Existing(id) => {
+                    entry.scope = Some(id);
+                    None
+                }
+                Target::NewAt(dir) => {
+                    let scope = self.scopes.plan_create(&dir, &now_timestamp());
+                    entry.scope = Some(scope.id.clone());
+                    Some(scope)
+                }
+            },
+        };
+        let new_key = EntryKey::of(&entry);
         self.store.update(key, entry)?;
-        self.persist()
+        if let Some(scope) = pending {
+            self.scopes.insert(scope);
+        }
+        self.persist()?;
+        Ok(new_key)
     }
 
     /// Remove an entry and persist.
@@ -331,7 +366,7 @@ impl App {
                 entry.capture_policy = CapturePolicy::Confirm;
             }
         }
-        self.update(key, entry)
+        self.update(key, entry, None).map(|_| ())
     }
 }
 
@@ -524,6 +559,105 @@ mod tests {
 
         assert_eq!(key, EntryKey::global("ll"));
         assert!(app.scopes.is_empty());
+    }
+
+    #[test]
+    fn update_without_a_placement_keeps_the_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir).with_cwd(api.canonicalize().unwrap());
+        let key = app
+            .add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Here)
+            .unwrap();
+
+        let mut edited = app.store.find(&key).unwrap().clone();
+        edited.command = "ls -lah".into();
+
+        let new_key = app.update(&key, edited, None).unwrap();
+
+        assert_eq!(new_key, key);
+        assert_eq!(app.store.find(&key).unwrap().command, "ls -lah");
+    }
+
+    #[test]
+    fn move_here_creates_a_scope_for_a_global_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir);
+        let key = app
+            .add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Global)
+            .unwrap();
+
+        let mut app = app.with_cwd(api.canonicalize().unwrap());
+        let entry = app.store.find(&key).unwrap().clone();
+        let new_key = app.update(&key, entry, Some(&Placement::Here)).unwrap();
+
+        assert_eq!(new_key.scope.as_deref(), Some("api"));
+        assert!(app.store.find(&key).is_none());
+        assert_eq!(app.scopes.scopes().len(), 1);
+    }
+
+    #[test]
+    fn make_global_rescues_an_entry_from_an_unknown_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let mut store = Store::default();
+        let mut entry = Entry::new("ghost", Kind::Alias, "boo", "d");
+        entry.scope = Some("gone".into());
+        store.add(entry.clone()).unwrap();
+        let mut app = App::with(paths, Config::default(), store);
+
+        let key = EntryKey {
+            scope: Some("gone".into()),
+            name: "ghost".into(),
+        };
+        let new_key = app.update(&key, entry, Some(&Placement::Global)).unwrap();
+
+        assert_eq!(new_key, EntryKey::global("ghost"));
+    }
+
+    #[test]
+    fn move_to_an_unknown_scope_errors_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let key = app
+            .add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Global)
+            .unwrap();
+        let entry = app.store.find(&key).unwrap().clone();
+
+        let err = app
+            .update(&key, entry, Some(&Placement::Scope("nope".into())))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown scope 'nope'"), "err was: {err}");
+        assert!(app.scopes.is_empty());
+        assert!(app.store.find(&key).is_some());
+    }
+
+    #[test]
+    fn moving_onto_an_existing_pair_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir);
+        let global = app
+            .add(Entry::new("ll", Kind::Alias, "ls", "d"), &Placement::Global)
+            .unwrap();
+        let mut app = app.with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("ll", Kind::Alias, "ls -lah", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        let entry = app.store.find(&global).unwrap().clone();
+
+        assert!(app.update(&global, entry, Some(&Placement::Here)).is_err());
+        assert!(app.store.find(&global).is_some());
     }
 
     #[test]

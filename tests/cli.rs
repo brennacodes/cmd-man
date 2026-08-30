@@ -570,3 +570,46 @@ fn current_scope_fails_outside_a_scope() {
         .failure()
         .stderr(predicate::str::contains("no scope"));
 }
+
+#[test]
+fn edit_move_here_scopes_an_existing_global() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd(&home)
+        .args(["add", "dep", "-c", "echo dep", "--desc", "d"])
+        .assert()
+        .success();
+
+    cmd_in(&home, &api)
+        .args(["edit", "dep", "--move-here", "--no-help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dep (api)"));
+
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(zsh.contains("_cmdman_on_1"), "zsh was: {zsh}");
+}
+
+#[test]
+fn edit_move_to_an_unknown_scope_errors() {
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["add", "dep", "-c", "echo dep", "--desc", "d"])
+        .assert()
+        .success();
+
+    cmd(&home)
+        .args(["edit", "dep", "--move-to", "nope", "--no-help"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown scope 'nope'"));
+
+    let scopes_file = store_dir(&home).join("scopes.toml");
+    assert!(
+        !scopes_file.exists() || {
+            let s = std::fs::read_to_string(&scopes_file).unwrap();
+            !s.contains("nope")
+        }
+    );
+}
