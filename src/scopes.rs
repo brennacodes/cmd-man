@@ -112,7 +112,7 @@ impl ScopeRegistry {
         let taken: HashSet<&str> = self.scopes.iter().map(|s| s.id.as_str()).collect();
         let mut id = base.clone();
         let mut suffix = 1;
-        while RESERVED_IDS.contains(&id.as_str()) || taken.contains(id.as_str()) {
+        while is_reserved_id(&id) || taken.contains(id.as_str()) {
             suffix += 1;
             id = format!("{base}-{suffix}");
         }
@@ -246,6 +246,51 @@ pub fn slug_id(dir: &Path) -> String {
     }
 }
 
+/// Whether an id is one of the placement keywords. Such an id would be
+/// unreachable through `--in` and `--move-to`, which read those words as
+/// keywords rather than as scope ids.
+pub fn is_reserved_id(id: &str) -> bool {
+    RESERVED_IDS.contains(&id)
+}
+
+/// Whether an id is safe to store. Anything outside this character class
+/// would be carried verbatim into the generated shell file, where a newline
+/// or a quote turns a scope comment into live code.
+pub fn is_valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Make `dir` absolute against `base` and resolve `.` and `..` textually.
+/// Never canonicalized: a stored scope path has to keep the shape the shell
+/// gives `$PWD`, which is also lexical.
+pub fn normalize_dir(base: &Path, dir: &Path) -> PathBuf {
+    let joined = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        base.join(dir)
+    };
+    let absolute = joined.is_absolute();
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() && !absolute {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 /// Whether `cwd` is `scope_dir` or lives under it. Compared as text on a
 /// component boundary so it matches the generated shell's `case` test exactly.
 pub fn path_contains(scope_dir: &Path, cwd: &Path) -> bool {
@@ -362,7 +407,9 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || canonical(a) == canonical(b)
 }
 
-fn canonical(path: &Path) -> PathBuf {
+/// A path with its symlinks resolved, or the path as written when it does not
+/// exist.
+pub fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -434,6 +481,40 @@ mod tests {
             Path::new("/foo/bar/"),
             Path::new("/foo/bar/baz")
         ));
+    }
+
+    #[test]
+    fn normalize_dir_absolutizes_and_folds_dot_segments() {
+        let base = Path::new("/w/api");
+        assert_eq!(
+            normalize_dir(base, Path::new("src")),
+            Path::new("/w/api/src")
+        );
+        assert_eq!(
+            normalize_dir(base, Path::new("./src")),
+            Path::new("/w/api/src")
+        );
+        assert_eq!(
+            normalize_dir(base, Path::new("../other")),
+            Path::new("/w/other")
+        );
+        assert_eq!(
+            normalize_dir(base, Path::new("/tmp/./x/..")),
+            Path::new("/tmp")
+        );
+        assert_eq!(normalize_dir(base, Path::new("/../..")), Path::new("/"));
+    }
+
+    #[test]
+    fn id_validation_rejects_keywords_and_shell_metacharacters() {
+        assert!(is_reserved_id("global"));
+        assert!(!is_reserved_id("api"));
+        assert!(is_valid_id("api"));
+        assert!(is_valid_id("api_2-x"));
+        assert!(!is_valid_id(""));
+        assert!(!is_valid_id("bad\nalias pwned=oops #"));
+        assert!(!is_valid_id("a b"));
+        assert!(!is_valid_id("a'b"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Service layer shared by the CLI and TUI: loads state and centralizes every
 //! mutation so the store and generated shell files stay in sync.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use time::OffsetDateTime;
@@ -11,7 +11,7 @@ use crate::capture::{self, Assessment, CaptureResult};
 use crate::config::Config;
 use crate::model::{CapturePolicy, Entry, EntryKey};
 use crate::paths::{self, Paths};
-use crate::scopes::{self, Placement, ScopeRegistry, Target};
+use crate::scopes::{self, Placement, Scope, ScopeRegistry, Target};
 use crate::search::{Filter, search};
 use crate::shell;
 use crate::store::Store;
@@ -26,6 +26,22 @@ pub enum Selection<'a> {
     In(&'a str),
     /// Only a scope covering the working directory.
     CurrentScope,
+}
+
+/// A registered scope as `cmd-man scope list` reports it.
+#[derive(Debug, Clone)]
+pub struct ScopeSummary {
+    pub id: String,
+    /// The directory as stored, `$HOME`-relative when it lives under home.
+    pub path: String,
+    pub resolved: PathBuf,
+    pub entries: usize,
+    pub exists: bool,
+    pub active: bool,
+    /// The working directory this scope contains only once symlinks are
+    /// resolved. The dispatcher matches the shell's logical `$PWD`, so such a
+    /// scope stays inactive even while the user stands inside it.
+    pub inactive_via_symlink: Option<PathBuf>,
 }
 
 /// Loaded application state.
@@ -304,6 +320,139 @@ impl App {
         let removed = self.store.remove(key)?;
         self.persist()?;
         Ok(removed)
+    }
+
+    /// Every registered scope, with what the user needs to tell a healthy
+    /// scope from one that can never activate here.
+    pub fn scope_summaries(&self) -> Vec<ScopeSummary> {
+        self.scopes
+            .scopes()
+            .iter()
+            .map(|scope| {
+                let resolved = paths::expand_path(&scope.path);
+                let active = scopes::path_contains(&resolved, &self.cwd);
+                let reached_by_realpath = scopes::path_contains(
+                    &scopes::canonical(&resolved),
+                    &scopes::canonical(&self.cwd),
+                );
+                ScopeSummary {
+                    id: scope.id.clone(),
+                    path: scope.path.clone(),
+                    entries: self.entries_in_scope(&scope.id).len(),
+                    exists: resolved.is_dir(),
+                    active,
+                    inactive_via_symlink: (!active && reached_by_realpath)
+                        .then(|| self.cwd.clone()),
+                    resolved,
+                }
+            })
+            .collect()
+    }
+
+    /// Point a scope at a different directory and persist. Unlike a move, an
+    /// unknown id is created rather than rejected: this is how an entry whose
+    /// scope went missing is made live again.
+    pub fn relocate_scope(&mut self, id: &str, dir: &Path) -> Result<()> {
+        let id = id.trim();
+        if id.is_empty() {
+            bail!("a scope id is required");
+        }
+        if scopes::is_reserved_id(id) {
+            bail!("'{id}' is a reserved scope id");
+        }
+        if !scopes::is_valid_id(id) {
+            bail!("'{id}' is not a valid scope id: use letters, digits, '-' and '_'");
+        }
+        // Stored the way the shell would name the directory, since the
+        // dispatcher matches the logical `$PWD`. Only made absolute, never
+        // resolved through symlinks.
+        let dir = scopes::normalize_dir(&self.cwd, dir);
+        // Compared through symlinks rather than by exact text, so a scope
+        // stored the way the shell names a directory still counts as the
+        // claim on the directory this relocation just resolved.
+        if let Some(other) = self
+            .scopes
+            .scopes()
+            .iter()
+            .find(|s| s.id != id && scopes::same_dir(&paths::expand_path(&s.path), &dir))
+        {
+            bail!(
+                "'{}' is already the scope for {}",
+                other.id,
+                paths::portable_path(&dir)
+            );
+        }
+        if self.scopes.find(id).is_some() {
+            self.scopes.relocate(id, &dir)?;
+        } else {
+            self.scopes.insert(Scope {
+                id: id.to_string(),
+                path: paths::portable_path(&dir),
+                created_at: now_timestamp(),
+            });
+        }
+        self.persist()
+    }
+
+    /// Remove a scope, moving its entries out to global, and persist. Every
+    /// name is checked first so a collision leaves the scope exactly as it
+    /// was rather than promoting half of it.
+    pub fn remove_scope_promoting(&mut self, id: &str) -> Result<usize> {
+        let entries = self.scope_entries_to_move(id)?;
+        let mut collisions: Vec<&str> = entries
+            .iter()
+            .filter(|e| self.store.find(&EntryKey::global(&e.name)).is_some())
+            .map(|e| e.name.as_str())
+            .collect();
+        if !collisions.is_empty() {
+            collisions.sort_unstable();
+            bail!(
+                "cannot promote scope '{id}': a global entry already exists named {}",
+                collisions.join(", ")
+            );
+        }
+        for entry in &entries {
+            let mut promoted = entry.clone();
+            promoted.scope = None;
+            self.store.update(&EntryKey::of(entry), promoted)?;
+        }
+        self.drop_scope(id);
+        self.persist()?;
+        Ok(entries.len())
+    }
+
+    /// Remove a scope along with every entry in it, and persist.
+    pub fn remove_scope_deleting(&mut self, id: &str) -> Result<usize> {
+        let entries = self.scope_entries_to_move(id)?;
+        for entry in &entries {
+            self.store.remove(&EntryKey::of(entry))?;
+        }
+        self.drop_scope(id);
+        self.persist()?;
+        Ok(entries.len())
+    }
+
+    fn entries_in_scope(&self, id: &str) -> Vec<&Entry> {
+        self.store
+            .entries()
+            .iter()
+            .filter(|e| e.scope.as_deref() == Some(id))
+            .collect()
+    }
+
+    /// The entries a scope removal has to deal with. An id no registry knows
+    /// is still accepted while entries reference it, so a scope lost to a
+    /// hand edit or a merge can be cleaned up.
+    fn scope_entries_to_move(&self, id: &str) -> Result<Vec<Entry>> {
+        let entries: Vec<Entry> = self.entries_in_scope(id).into_iter().cloned().collect();
+        if entries.is_empty() && self.scopes.find(id).is_none() {
+            bail!("unknown scope '{id}'");
+        }
+        Ok(entries)
+    }
+
+    fn drop_scope(&mut self, id: &str) {
+        let _ = self.scopes.remove(id);
     }
 
     /// Search the store.
@@ -845,6 +994,286 @@ mod tests {
             "notices were: {:?}",
             app.notices()
         );
+    }
+
+    #[test]
+    fn relocate_creates_an_unknown_scope_and_rejects_a_claimed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut app = test_app(&dir);
+
+        app.relocate_scope("gone", &a).unwrap();
+        assert_eq!(
+            app.scopes.find("gone").unwrap().path,
+            paths::portable_path(&a)
+        );
+
+        app.relocate_scope("other", &b).unwrap();
+        let err = app.relocate_scope("other", &a).unwrap_err().to_string();
+        assert!(err.contains("already"), "err was: {err}");
+        assert!(app.relocate_scope("  ", &a).is_err());
+    }
+
+    #[test]
+    fn relocate_keeps_the_symlinked_path_the_shell_would_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("actual/api");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("api");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut app = test_app(&dir);
+
+        app.relocate_scope("api", &link).unwrap();
+        assert_eq!(
+            app.scopes.find("api").unwrap().path,
+            paths::portable_path(&link)
+        );
+
+        app.add(
+            Entry::new("dep", Kind::Alias, "deploy", "d"),
+            &Placement::Scope("api".into()),
+        )
+        .unwrap();
+
+        // Relocating onto the directory it already covers is a no-op, not a
+        // silent rewrite to the realpath that would stop the scope matching.
+        app.relocate_scope("api", &link).unwrap();
+        assert_eq!(
+            app.scopes.find("api").unwrap().path,
+            paths::portable_path(&link)
+        );
+        let zsh = std::fs::read_to_string(dir.path().join("shell/cmd-man.zsh")).unwrap();
+        assert!(
+            zsh.contains(&format!("_cmdman_dir_1='{}'", link.display())),
+            "zsh was: {zsh}"
+        );
+    }
+
+    #[test]
+    fn relocate_stores_a_relative_directory_against_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut app = test_app(&dir).with_cwd(cwd.clone());
+
+        app.relocate_scope("later", Path::new("./notyet")).unwrap();
+        assert_eq!(
+            app.scopes.find("later").unwrap().path,
+            paths::portable_path(&cwd.join("notyet"))
+        );
+    }
+
+    #[test]
+    fn relocate_rejects_a_reserved_or_unsafe_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut app = test_app(&dir);
+
+        for id in ["global", "all", "here"] {
+            let err = app.relocate_scope(id, &target).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "err was: {err}");
+        }
+
+        let injected = "bad\nalias pwned=oops #";
+        let err = app
+            .relocate_scope(injected, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid scope id"), "err was: {err}");
+        assert!(app.scopes.scopes().is_empty());
+    }
+
+    #[test]
+    fn relocate_rejects_a_directory_claimed_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("actual/api");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("api");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut app = test_app(&dir).with_scopes(ScopeRegistry::from_scopes(vec![Scope {
+            id: "api".into(),
+            path: link.display().to_string(),
+            created_at: "t".into(),
+        }]));
+
+        let err = app.relocate_scope("other", &link).unwrap_err().to_string();
+        assert!(err.contains("'api' is already"), "err was: {err}");
+        app.relocate_scope("api", &link).unwrap();
+    }
+
+    #[test]
+    fn promote_to_global_fails_the_whole_operation_on_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir);
+        app.add(
+            Entry::new("ll", Kind::Alias, "global", "d"),
+            &Placement::Global,
+        )
+        .unwrap();
+        let mut app = app.with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("ll", Kind::Alias, "scoped", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+        app.add(
+            Entry::new("dep", Kind::Alias, "deploy", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        let err = app.remove_scope_promoting("api").unwrap_err().to_string();
+        assert!(err.contains("ll"), "err was: {err}");
+        assert!(app.scopes.find("api").is_some());
+        assert_eq!(app.store.find_all_named("dep").len(), 1);
+        assert_eq!(
+            app.store.find_all_named("dep")[0].scope.as_deref(),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn promote_to_global_moves_every_entry_when_there_is_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir).with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("dep", Kind::Alias, "deploy", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+        app.add(
+            Entry::new("bld", Kind::Alias, "build", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        assert_eq!(app.remove_scope_promoting("api").unwrap(), 2);
+        assert!(app.scopes.find("api").is_none());
+        assert!(app.store.find(&EntryKey::global("dep")).is_some());
+        assert!(app.store.find(&EntryKey::global("bld")).is_some());
+    }
+
+    #[test]
+    fn delete_entries_removes_the_scope_and_its_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir);
+        app.add(
+            Entry::new("keep", Kind::Alias, "keep", "d"),
+            &Placement::Global,
+        )
+        .unwrap();
+        let mut app = app.with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("dep", Kind::Alias, "deploy", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+
+        assert_eq!(app.remove_scope_deleting("api").unwrap(), 1);
+        assert!(app.scopes.find("api").is_none());
+        assert!(app.store.find_all_named("dep").is_empty());
+        assert!(app.store.find(&EntryKey::global("keep")).is_some());
+    }
+
+    #[test]
+    fn removing_a_scope_no_registry_knows_still_rescues_its_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let mut store = Store::default();
+        let mut entry = Entry::new("ghost", Kind::Alias, "boo", "d");
+        entry.scope = Some("gone".into());
+        store.add(entry).unwrap();
+        let mut app = App::with(paths, Config::default(), store);
+
+        assert_eq!(app.remove_scope_promoting("gone").unwrap(), 1);
+        assert!(app.store.find(&EntryKey::global("ghost")).is_some());
+        assert!(app.remove_scope_promoting("gone").is_err());
+    }
+
+    #[test]
+    fn summaries_report_existence_activity_and_entry_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = dir.path().join("work/api");
+        std::fs::create_dir_all(&api).unwrap();
+        let mut app = test_app(&dir).with_cwd(api.canonicalize().unwrap());
+        app.add(
+            Entry::new("dep", Kind::Alias, "deploy", "d"),
+            &Placement::Here,
+        )
+        .unwrap();
+        app.scopes.insert(Scope {
+            id: "elsewhere".into(),
+            path: "/no/such/dir".into(),
+            created_at: "t".into(),
+        });
+
+        let summaries = app.scope_summaries();
+        let api = summaries.iter().find(|s| s.id == "api").unwrap();
+        assert!(api.exists && api.active && api.entries == 1);
+        assert!(api.inactive_via_symlink.is_none());
+        let gone = summaries.iter().find(|s| s.id == "elsewhere").unwrap();
+        assert!(!gone.exists && !gone.active && gone.entries == 0);
+    }
+
+    /// `root` and the realpath and symlink directories under it, with `root`
+    /// canonical so a symlinked `TMPDIR` cannot decide the outcome.
+    fn symlinked_dirs(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("actual/api");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("api");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        (real, link)
+    }
+
+    #[test]
+    fn a_summary_flags_a_scope_the_shell_cannot_match_from_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let (real, link) = symlinked_dirs(&dir);
+        let app = test_app(&dir)
+            .with_cwd(link.clone())
+            .with_scopes(ScopeRegistry::from_scopes(vec![Scope {
+                id: "api".into(),
+                path: real.display().to_string(),
+                created_at: "t".into(),
+            }]));
+
+        let summary = &app.scope_summaries()[0];
+        assert!(summary.exists);
+        assert!(!summary.active);
+        assert_eq!(
+            summary.inactive_via_symlink.as_deref(),
+            Some(link.as_path())
+        );
+    }
+
+    #[test]
+    fn a_summary_leaves_a_scope_stored_as_the_symlinked_path_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, link) = symlinked_dirs(&dir);
+        let app = test_app(&dir)
+            .with_cwd(link.clone())
+            .with_scopes(ScopeRegistry::from_scopes(vec![Scope {
+                id: "api".into(),
+                path: link.display().to_string(),
+                created_at: "t".into(),
+            }]));
+
+        let summary = &app.scope_summaries()[0];
+        assert!(summary.exists);
+        assert!(summary.active);
+        assert!(summary.inactive_via_symlink.is_none());
     }
 
     #[test]

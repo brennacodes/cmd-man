@@ -1,6 +1,7 @@
 //! Command-line interface: argument parsing and non-interactive handlers.
 
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -9,7 +10,7 @@ use crate::app::{App, Selection, now_timestamp};
 use crate::backup;
 use crate::capture;
 use crate::model::{Entry, EntryKey, Kind};
-use crate::paths::Paths;
+use crate::paths::{self, Paths};
 use crate::scopes::Placement;
 use crate::search::{Filter, ScopeFilter};
 use crate::shell::{self, Shell};
@@ -68,6 +69,11 @@ enum Command {
         #[command(flatten)]
         selection: SelectionArgs,
     },
+    /// Inspect and repair directory scopes.
+    Scope {
+        #[command(subcommand)]
+        command: ScopeCommand,
+    },
     /// Import currently active shell aliases and functions.
     Import {
         #[arg(long)]
@@ -81,6 +87,30 @@ enum Command {
     Backup,
     /// Restore the store from the GitHub backup.
     Restore,
+}
+
+#[derive(Subcommand)]
+enum ScopeCommand {
+    /// List directory scopes.
+    List,
+    /// Point a scope at a different directory, creating it if it is unknown.
+    Relocate {
+        /// The scope id to point somewhere new.
+        id: String,
+        /// The directory the scope covers from now on.
+        path: PathBuf,
+    },
+    /// Remove a scope. Its entries are promoted to global or deleted.
+    #[command(group = ArgGroup::new("disposition").multiple(false).required(true))]
+    Rm {
+        id: String,
+        /// Keep the entries by making them global.
+        #[arg(long, group = "disposition")]
+        promote_to_global: bool,
+        /// Delete the entries along with the scope.
+        #[arg(long, group = "disposition")]
+        delete_entries: bool,
+    },
 }
 
 #[derive(Args)]
@@ -230,6 +260,7 @@ fn dispatch(cmd: Command) -> Result<()> {
             yes,
             selection,
         } => cmd_capture(&name, yes, &selection),
+        Command::Scope { command } => dispatch_scope(command),
         Command::Import { yes } => cmd_import(yes),
         Command::Init => cmd_init(),
         Command::Reload => cmd_reload(),
@@ -544,6 +575,91 @@ fn do_capture(app: &mut App, key: &EntryKey, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn dispatch_scope(cmd: ScopeCommand) -> Result<()> {
+    match cmd {
+        ScopeCommand::List => cmd_scope_list(),
+        ScopeCommand::Relocate { id, path } => cmd_scope_relocate(&id, &path),
+        ScopeCommand::Rm {
+            id,
+            promote_to_global,
+            ..
+        } => cmd_scope_rm(&id, promote_to_global),
+    }
+}
+
+fn cmd_scope_list() -> Result<()> {
+    let app = load_app()?;
+    let summaries = app.scope_summaries();
+    if summaries.is_empty() {
+        println!("No scopes.");
+        return Ok(());
+    }
+    let width = summaries.iter().map(|s| s.id.len()).max().unwrap_or(0);
+    for summary in &summaries {
+        let mut line = format!(
+            "{:width$}  {}  {}",
+            summary.id,
+            summary.path,
+            count_label(summary.entries)
+        );
+        if summary.active {
+            line.push_str("  (active)");
+        }
+        if !summary.exists {
+            line.push_str("  (missing)");
+        }
+        // The dispatcher tests the shell's logical `$PWD`, so a scope stored
+        // under a resolved path stays inactive in a directory reached through
+        // a symlink. Nothing else in the listing explains that.
+        if let Some(cwd) = &summary.inactive_via_symlink {
+            line.push_str(&format!(
+                "  (inactive here: $PWD is {}, which reaches it through a symlink)",
+                paths::portable_path(cwd)
+            ));
+        }
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn cmd_scope_relocate(id: &str, path: &Path) -> Result<()> {
+    let mut app = load_app()?;
+    let id = id.trim();
+    app.relocate_scope(id, path)?;
+    let stored = app
+        .scopes
+        .find(id)
+        .map(|s| s.path.clone())
+        .unwrap_or_else(|| path.display().to_string());
+    println!("Scope '{id}' now covers {stored}.");
+    print_reload_hint(&app);
+    Ok(())
+}
+
+fn cmd_scope_rm(id: &str, promote_to_global: bool) -> Result<()> {
+    let mut app = load_app()?;
+    if promote_to_global {
+        let moved = app.remove_scope_promoting(id)?;
+        println!(
+            "Removed scope '{id}' and promoted {} to global.",
+            count_label(moved)
+        );
+    } else {
+        let deleted = app.remove_scope_deleting(id)?;
+        println!("Removed scope '{id}' and deleted {}.", count_label(deleted));
+    }
+    print_reload_hint(&app);
+    Ok(())
+}
+
+fn count_label(count: usize) -> String {
+    if count == 1 {
+        "1 entry".to_string()
+    } else {
+        format!("{count} entries")
+    }
+}
+
 fn cmd_import(yes: bool) -> Result<()> {
     let mut app = load_app()?;
     let shell = detect_user_shell();
@@ -721,6 +837,13 @@ mod tests {
     fn split_tags_trims_and_filters() {
         assert_eq!(split_tags("a, b ,,c"), vec!["a", "b", "c"]);
         assert!(split_tags("   ").is_empty());
+    }
+
+    #[test]
+    fn count_label_pluralizes() {
+        assert_eq!(count_label(0), "0 entries");
+        assert_eq!(count_label(1), "1 entry");
+        assert_eq!(count_label(2), "2 entries");
     }
 
     #[test]

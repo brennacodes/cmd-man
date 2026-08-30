@@ -698,3 +698,187 @@ fn search_finds_entries_from_every_scope() {
         .success()
         .stdout(predicate::str::contains("deployer (api)"));
 }
+
+#[test]
+fn scope_list_reports_scopes() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd_in(&home, &api)
+        .args(["add", "dep", "-c", "echo dep", "--desc", "d", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, &api)
+        .args(["scope", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("api"))
+        .stdout(predicate::str::contains("1"))
+        .stdout(predicate::str::contains("(active)"));
+
+    cmd_in(&home, home.path())
+        .args(["scope", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(active)").not());
+}
+
+#[test]
+fn scope_list_explains_a_scope_the_shell_cannot_match_from_here() {
+    let home = TempDir::new().unwrap();
+    let real = home.path().join("actual/proj");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = home.path().join("proj");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    cmd(&home)
+        .args(["scope", "relocate", "proj", &real.display().to_string()])
+        .assert()
+        .success();
+
+    // The dispatcher matches `$PWD`, so standing in the symlinked path leaves
+    // the scope inactive even though it is the same directory.
+    cmd_in(&home, &link)
+        .args(["scope", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(active)").not())
+        .stdout(predicate::str::contains(
+            "(inactive here: $PWD is $HOME/proj, which reaches it through a symlink)",
+        ));
+
+    cmd_in(&home, &real)
+        .args(["scope", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(active)"))
+        .stdout(predicate::str::contains("inactive here").not());
+}
+
+#[test]
+fn scope_rm_requires_a_disposition() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd_in(&home, &api)
+        .args(["add", "dep", "-c", "echo dep", "--desc", "d", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, home.path())
+        .args(["scope", "rm", "api"])
+        .assert()
+        .failure();
+    cmd_in(&home, home.path())
+        .args(["scope", "rm", "api", "--promote-to-global"])
+        .assert()
+        .success();
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(zsh.contains("alias dep="), "zsh was: {zsh}");
+    assert!(!zsh.contains("_cmdman_dir_1"), "zsh was: {zsh}");
+}
+
+#[test]
+fn scope_rm_can_delete_the_entries_with_the_scope() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd_in(&home, &api)
+        .args(["add", "dep", "-c", "echo dep", "--desc", "d", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, home.path())
+        .args(["scope", "rm", "api", "--delete-entries"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 entry"));
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(!zsh.contains("echo dep"), "zsh was: {zsh}");
+}
+
+#[test]
+fn scope_relocate_adopts_an_orphaned_entry() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd_in(&home, home.path())
+        .args(["add", "ghost", "-c", "echo boo", "--desc", "d"])
+        .assert()
+        .success();
+    let file = store_dir(&home).join("categories/general.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("name = \"ghost\"", "name = \"ghost\"\nscope = \"gone\""),
+    )
+    .unwrap();
+
+    cmd_in(&home, home.path())
+        .args(["scope", "relocate", "gone", api.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(zsh.contains("echo boo"), "zsh was: {zsh}");
+    assert!(
+        zsh.contains(&format!("_cmdman_dir_1='{}'", api.display())),
+        "zsh was: {zsh}"
+    );
+}
+
+#[test]
+fn scope_relocate_keeps_a_symlinked_directory_the_way_the_shell_names_it() {
+    let home = TempDir::new().unwrap();
+    let real = home.path().join("actual/proj");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = home.path().join("proj");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    cmd_in(&home, &link)
+        .args(["add", "dep", "-c", "make deploy", "--desc", "d", "--here"])
+        .assert()
+        .success();
+
+    cmd_in(&home, &link)
+        .args(["scope", "relocate", "proj", link.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let zsh = std::fs::read_to_string(store_dir(&home).join("shell/cmd-man.zsh")).unwrap();
+    assert!(
+        zsh.contains(&format!("_cmdman_dir_1='{}'", link.display())),
+        "zsh was: {zsh}"
+    );
+}
+
+#[test]
+fn scope_relocate_rejects_a_reserved_or_unsafe_id() {
+    let home = TempDir::new().unwrap();
+    let proj = home.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    cmd_in(&home, home.path())
+        .args(["scope", "relocate", "global", proj.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved"));
+
+    cmd_in(&home, home.path())
+        .args([
+            "scope",
+            "relocate",
+            "bad\nalias pwned=oops #",
+            proj.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a valid scope id"));
+
+    cmd_in(&home, home.path())
+        .args(["scope", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No scopes."));
+}
