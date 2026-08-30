@@ -76,7 +76,7 @@ pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String
         "# Regenerate with: cmd-man reload ({})\n\n",
         shell.as_str()
     ));
-    out.push_str(&render_preamble(shell, &managed_names(&entries, scopes)));
+    out.push_str(&render_preamble(&managed_names(&entries, scopes)));
 
     for entry in &globals {
         out.push_str(&render_entry(entry, ""));
@@ -320,30 +320,26 @@ fn managed_names(entries: &[&Entry], scopes: &ScopeRegistry) -> Vec<String> {
 /// Clear both namespaces for every managed name so a re-source starts from a
 /// known state, whichever kind each name was defined as last time.
 ///
-/// The leading loop clears the names recorded by whichever generation of the
-/// file this shell sourced last, which is the only way a deleted name can go
+/// The clearing is carried by `_cmdman_forget`, which the file first calls in
+/// whatever form this shell sourced last and then redefines and calls again.
+/// Calling the previous generation's copy is the only way a deleted name can go
 /// away: the regenerated file no longer mentions it, so nothing else here would
-/// name it. The current set is then recorded in `_cmdman_names` for the next
-/// re-source. zsh does not word-split an unquoted parameter, so it needs the
-/// `${=name}` form that bash does not have.
-fn render_preamble(shell: Shell, names: &[String]) -> String {
-    let recorded = match shell {
-        Shell::Zsh => "${=_cmdman_names-}",
-        Shell::Bash => "${_cmdman_names-}",
-    };
+/// name it. Carrying the set as a function body rather than as a string that
+/// gets word-split means the cleanup does not depend on the user's `IFS`.
+fn render_preamble(names: &[String]) -> String {
     let mut out = String::from("# Clear any previous cmd-man definitions.\n");
-    out.push_str(&format!("for _cmdman_stale in {recorded}; do\n"));
-    out.push_str("  unalias -- \"$_cmdman_stale\" 2>/dev/null\n");
-    out.push_str("  unset -f -- \"$_cmdman_stale\" 2>/dev/null\n");
-    out.push_str("done\n");
-    out.push_str("unset _cmdman_stale\n");
-    for name in names {
-        out.push_str(&render_clearing(name, ""));
+    out.push_str("if typeset -f _cmdman_forget >/dev/null 2>&1; then\n");
+    out.push_str("  _cmdman_forget\n");
+    out.push_str("fi\n");
+    out.push_str("function _cmdman_forget {\n");
+    if names.is_empty() {
+        out.push_str("  :\n");
     }
-    out.push_str(&format!(
-        "_cmdman_names={}\n",
-        single_quote(&names.join(" "))
-    ));
+    for name in names {
+        out.push_str(&render_clearing(name, "  "));
+    }
+    out.push_str("}\n");
+    out.push_str("_cmdman_forget\n");
     out.push('\n');
     out
 }
@@ -842,20 +838,21 @@ mod tests {
     #[test]
     fn preamble_clears_the_names_the_last_generation_recorded() {
         let entries = vec![alias_entry("ll", "ls -la")];
-        let zsh = render(Shell::Zsh, &entries, &ScopeRegistry::default());
-        let bash = render(Shell::Bash, &entries, &ScopeRegistry::default());
-        assert!(
-            preamble_of(&zsh).contains("for _cmdman_stale in ${=_cmdman_names-}; do"),
-            "zsh needs the splitting form: {zsh}"
-        );
-        assert!(
-            preamble_of(&bash).contains("for _cmdman_stale in ${_cmdman_names-}; do"),
-            "bash has no splitting form: {bash}"
-        );
-        for out in [&zsh, &bash] {
+        for shell in [Shell::Zsh, Shell::Bash] {
+            let out = render(shell, &entries, &ScopeRegistry::default());
+            let preamble = preamble_of(&out);
+            // The previous generation's copy runs before it is replaced, so a
+            // name this generation dropped is still cleared.
+            let call_old = preamble.find("  _cmdman_forget\n").unwrap();
+            let define = preamble.find("function _cmdman_forget {").unwrap();
+            assert!(call_old < define, "preamble was: {preamble}");
             assert!(
-                preamble_of(out).contains("_cmdman_names='ll'"),
-                "the current set must be recorded: {out}"
+                preamble.ends_with("}\n_cmdman_forget"),
+                "the new copy must run too: {preamble}"
+            );
+            assert!(
+                preamble.contains("if typeset -f _cmdman_forget >/dev/null 2>&1; then"),
+                "an absent previous copy must not be called: {preamble}"
             );
         }
     }
@@ -863,8 +860,9 @@ mod tests {
     #[test]
     fn preamble_records_an_empty_set_when_nothing_is_managed() {
         let out = render(Shell::Zsh, &[], &ScopeRegistry::default());
+        // An empty body is a parse error in both shells, so it needs a no-op.
         assert!(
-            preamble_of(&out).contains("_cmdman_names=''"),
+            preamble_of(&out).contains("function _cmdman_forget {\n  :\n}"),
             "out was: {out}"
         );
     }

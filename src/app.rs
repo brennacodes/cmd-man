@@ -39,10 +39,12 @@ pub struct ScopeSummary {
     pub entries: usize,
     pub exists: bool,
     pub active: bool,
-    /// The working directory this scope contains only once symlinks are
-    /// resolved. The dispatcher matches the shell's logical `$PWD`, so such a
-    /// scope stays inactive even while the user stands inside it.
-    pub inactive_via_symlink: Option<PathBuf>,
+    /// The working directory this scope contains only once the path is
+    /// resolved, whether through a symlink or through a case difference on a
+    /// case-insensitive volume. The dispatcher matches the shell's logical
+    /// `$PWD` verbatim, so such a scope stays inactive even while the user
+    /// stands inside it.
+    pub inactive_until_resolved: Option<PathBuf>,
 }
 
 /// Where an entry's example output is captured from.
@@ -130,8 +132,10 @@ impl App {
         unusable.dedup();
         for name in unusable {
             self.notices.push(format!(
-                "alias '{name}' is not a usable shell word and is not defined: \
-                 use letters, digits, '_', '-' and '.'"
+                "alias '{name}' cannot be defined in a shell file and is not defined: \
+                 use letters, digits, '_', '-' and '.', and do not start with '-' or \
+                 '{}'",
+                crate::model::RESERVED_NAME_PREFIX
             ));
         }
         self
@@ -275,8 +279,9 @@ impl App {
     }
 
     /// Add an entry at the requested placement and persist, returning the key
-    /// it landed under. The only place a scope is created: the store accepts
-    /// the entry first, so a rejected entry leaves no scope behind.
+    /// it landed under. One of the two places a placement creates a scope, the
+    /// other being [`App::update`]: the store accepts the entry first, so a
+    /// rejected entry leaves no scope behind.
     pub fn add(&mut self, mut entry: Entry, placement: &Placement) -> Result<EntryKey> {
         let pending = match self.resolve_target(placement)? {
             Target::Global => {
@@ -304,9 +309,8 @@ impl App {
 
     /// Update an entry (matched by `key`) and persist, returning the key it
     /// now lives under. A `placement` of `None` keeps the entry where it is.
-    /// The other place a scope is created, under the same rule as `add`: the
-    /// store accepts the entry first, so a rejected move leaves no scope
-    /// behind.
+    /// Creates a scope under the same rule as [`App::add`]: the store accepts
+    /// the entry first, so a rejected move leaves no scope behind.
     pub fn update(
         &mut self,
         key: &EntryKey,
@@ -391,7 +395,7 @@ impl App {
                     entries: self.entries_in_scope(&scope.id).len(),
                     exists: resolved.is_dir(),
                     active,
-                    inactive_via_symlink: (!active && reached_by_realpath)
+                    inactive_until_resolved: (!active && reached_by_realpath)
                         .then(|| self.cwd.clone()),
                     resolved,
                 }
@@ -1356,7 +1360,7 @@ mod tests {
         let summaries = app.scope_summaries();
         let api = summaries.iter().find(|s| s.id == "api").unwrap();
         assert!(api.exists && api.active && api.entries == 1);
-        assert!(api.inactive_via_symlink.is_none());
+        assert!(api.inactive_until_resolved.is_none());
         let gone = summaries.iter().find(|s| s.id == "elsewhere").unwrap();
         assert!(!gone.exists && !gone.active && gone.entries == 0);
     }
@@ -1388,7 +1392,7 @@ mod tests {
         assert!(summary.exists);
         assert!(!summary.active);
         assert_eq!(
-            summary.inactive_via_symlink.as_deref(),
+            summary.inactive_until_resolved.as_deref(),
             Some(link.as_path())
         );
     }
@@ -1408,7 +1412,7 @@ mod tests {
         let summary = &app.scope_summaries()[0];
         assert!(summary.exists);
         assert!(summary.active);
-        assert!(summary.inactive_via_symlink.is_none());
+        assert!(summary.inactive_until_resolved.is_none());
     }
 
     #[test]

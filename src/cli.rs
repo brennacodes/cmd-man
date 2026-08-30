@@ -615,12 +615,13 @@ fn cmd_scope_list() -> Result<()> {
         if !summary.exists {
             line.push_str("  (missing)");
         }
-        // The dispatcher tests the shell's logical `$PWD`, so a scope stored
-        // under a resolved path stays inactive in a directory reached through
-        // a symlink. Nothing else in the listing explains that.
-        if let Some(cwd) = &summary.inactive_via_symlink {
+        // The dispatcher tests the shell's logical `$PWD` verbatim, so a scope
+        // stays inactive whenever the two spellings differ only once resolved:
+        // a symlink, or a case difference on a case-insensitive volume.
+        // Nothing else in the listing explains that.
+        if let Some(cwd) = &summary.inactive_until_resolved {
             line.push_str(&format!(
-                "  (inactive here: $PWD is {}, which reaches it through a symlink)",
+                "  (inactive here: $PWD is {}, which reaches it only once the path is resolved)",
                 paths::portable_path(cwd)
             ));
         }

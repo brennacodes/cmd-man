@@ -302,7 +302,9 @@ fn an_entry_whose_name_carries_shell_syntax_warns_and_is_not_rendered() {
         .args(["list"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("not a usable shell word"));
+        .stderr(predicate::str::contains(
+            "cannot be defined in a shell file and is not defined",
+        ));
 
     cmd(&home).args(["reload"]).assert().success();
     for shell in ["cmd-man.zsh", "cmd-man.bash"] {
@@ -819,7 +821,7 @@ fn scope_list_explains_a_scope_the_shell_cannot_match_from_here() {
         .success()
         .stdout(predicate::str::contains("(active)").not())
         .stdout(predicate::str::contains(
-            "(inactive here: $PWD is $HOME/proj, which reaches it through a symlink)",
+            "(inactive here: $PWD is $HOME/proj, which reaches it only once the path is resolved)",
         ));
 
     cmd_in(&home, &real)

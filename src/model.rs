@@ -155,6 +155,13 @@ impl Entry {
         if self.name.starts_with('-') {
             return Err(format!("alias '{}' cannot start with '-'", self.name));
         }
+        if self.name.starts_with(RESERVED_NAME_PREFIX) {
+            return Err(format!(
+                "alias '{}' cannot start with '{RESERVED_NAME_PREFIX}': cmd-man's own \
+                 shell helpers use that prefix",
+                self.name
+            ));
+        }
         if self.command.trim().is_empty() {
             return Err(format!("alias '{}' must have a command", self.name));
         }
@@ -178,12 +185,18 @@ impl Entry {
     }
 }
 
-/// Whether `name` is a plain shell word: the gate the generated shell files
-/// rely on, since a name reaching the renderer off disk never went through
-/// [`Entry::validate`]. Everything `validate` accepts satisfies this.
+/// The prefix the generated shell files reserve for their own helpers, so an
+/// entry can never redefine the dispatcher or the clearing function and have
+/// its command run on every `cd` or every re-source.
+pub const RESERVED_NAME_PREFIX: &str = "_cmdman_";
+
+/// Whether `name` is a plain shell word the generated files may define: the
+/// gate the renderer relies on, since a name reaching it off disk never went
+/// through [`Entry::validate`]. Everything `validate` accepts satisfies this.
 pub fn is_usable_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
+        && !name.starts_with(RESERVED_NAME_PREFIX)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
@@ -285,6 +298,19 @@ mod tests {
         ] {
             assert!(!is_usable_name(bad), "expected '{bad}' to be unusable");
         }
+    }
+
+    #[test]
+    fn a_name_claiming_a_generated_helper_is_refused_and_unusable() {
+        // Otherwise the generated file redefines its own dispatcher or clearing
+        // function with the user's command, which then runs on every cd.
+        for bad in ["_cmdman_apply", "_cmdman_forget", "_cmdman_on_1"] {
+            let e = Entry::new(bad, Kind::Function, "echo hi", "desc");
+            assert!(e.validate().is_err(), "expected '{bad}' to be rejected");
+            assert!(!is_usable_name(bad), "expected '{bad}' to be unusable");
+        }
+        assert!(is_usable_name("_cmdman"));
+        assert!(is_usable_name("_myhelper"));
     }
 
     #[test]
