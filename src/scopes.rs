@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ScopeDefault;
 use crate::paths::{self, Paths};
 
 /// Ids the shell dispatcher and the CLI reserve for the unscoped set.
@@ -254,6 +255,111 @@ pub fn path_contains(scope_dir: &Path, cwd: &Path) -> bool {
     cwd == scope_dir || cwd.starts_with(&format!("{scope_dir}/"))
 }
 
+/// What the user asked for when placing an entry. Distinct from
+/// `Entry::scope`, which can only say "global" or "this scope" and has no way
+/// to say "the user said nothing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// Nothing was requested; the configured default decides.
+    Default,
+    Global,
+    /// The directory the command was run from, anchored at its repo root.
+    Here,
+    Scope(String),
+}
+
+impl Placement {
+    /// Parses a user-supplied placement string: an empty string is
+    /// [`Placement::Default`], `global` and `here` are their keywords, and
+    /// anything else is a scope id.
+    pub fn parse(text: &str) -> Placement {
+        let trimmed = text.trim();
+        match trimmed.to_lowercase().as_str() {
+            "" => Placement::Default,
+            "global" => Placement::Global,
+            "here" => Placement::Here,
+            _ => Placement::Scope(trimmed.to_string()),
+        }
+    }
+}
+
+/// A resolved placement. `NewAt` is a directory that has no scope yet; only
+/// `App::add` turns one into a registry entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Global,
+    Existing(String),
+    NewAt(PathBuf),
+}
+
+/// Resolve a placement against the registry without mutating anything. Fails
+/// only when an explicitly named scope does not exist.
+pub fn resolve_placement(
+    placement: &Placement,
+    mode: ScopeDefault,
+    registry: &ScopeRegistry,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Target> {
+    match placement {
+        Placement::Global => Ok(Target::Global),
+        Placement::Scope(id) => match registry.find(id) {
+            Some(scope) => Ok(Target::Existing(scope.id.clone())),
+            None => bail!("unknown scope '{id}'"),
+        },
+        Placement::Here => Ok(target_for_dir(registry, &anchor(cwd, home))),
+        Placement::Default => match mode {
+            ScopeDefault::Global => Ok(Target::Global),
+            ScopeDefault::Repo => {
+                let Some(root) = repo_root(cwd, home) else {
+                    return Ok(Target::Global);
+                };
+                let root = canonical(&root);
+                if home.map(canonical).as_deref() == Some(root.as_path()) || root.parent().is_none()
+                {
+                    return Ok(Target::Global);
+                }
+                Ok(target_for_dir(registry, &root))
+            }
+        },
+    }
+}
+
+/// Walk up from `start` looking for `.git`, as a directory or as a worktree
+/// file, stopping at `home` or the filesystem root.
+pub fn repo_root(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        if Some(dir) == home {
+            return None;
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// The directory `--here` means: the enclosing repo root when there is one,
+/// otherwise the working directory itself.
+fn anchor(cwd: &Path, home: Option<&Path>) -> PathBuf {
+    canonical(&repo_root(cwd, home).unwrap_or_else(|| cwd.to_path_buf()))
+}
+
+fn target_for_dir(registry: &ScopeRegistry, dir: &Path) -> Target {
+    match registry.find_by_path(dir) {
+        Some(scope) => Target::Existing(scope.id.clone()),
+        None => Target::NewAt(dir.to_path_buf()),
+    }
+}
+
+/// Canonicalize where possible so `/var` and `/private/var` compare equal on
+/// macOS, and leave a directory that does not exist usable rather than fatal.
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +497,180 @@ mod tests {
         let again = ScopeRegistry::load(&paths).unwrap();
         assert_eq!(again.find("api").unwrap().path, "$HOME/work/api");
         assert!(again.issues().is_empty());
+    }
+
+    #[test]
+    fn repo_root_finds_a_git_dir_or_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        let deep = root.join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(repo_root(&deep, None).unwrap(), root);
+
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(repo_root(&wt, None).unwrap(), wt);
+
+        let bare = dir.path().join("nothing");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(repo_root(&bare, Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn repo_root_stops_at_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let inside = home.join("proj");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert!(repo_root(&inside, Some(&home)).is_none());
+    }
+
+    #[test]
+    fn global_mode_default_is_global_even_inside_a_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let reg = ScopeRegistry::default();
+        let target =
+            resolve_placement(&Placement::Default, ScopeDefault::Global, &reg, &root, None)
+                .unwrap();
+        assert_eq!(target, Target::Global);
+    }
+
+    #[test]
+    fn repo_mode_default_targets_the_repo_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        let deep = root.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let reg = ScopeRegistry::default();
+        let target =
+            resolve_placement(&Placement::Default, ScopeDefault::Repo, &reg, &deep, None).unwrap();
+        assert_eq!(target, Target::NewAt(root.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn repo_mode_default_falls_back_to_global_outside_a_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = ScopeRegistry::default();
+        let target = resolve_placement(
+            &Placement::Default,
+            ScopeDefault::Repo,
+            &reg,
+            dir.path(),
+            Some(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(target, Target::Global);
+    }
+
+    #[test]
+    fn repo_mode_never_scopes_to_home_or_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let reg = ScopeRegistry::default();
+        let target = resolve_placement(
+            &Placement::Default,
+            ScopeDefault::Repo,
+            &reg,
+            &home,
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(target, Target::Global);
+    }
+
+    #[test]
+    fn here_reuses_an_existing_scope_and_ignores_the_home_guard() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        let deep = root.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let canonical = root.canonicalize().unwrap();
+
+        let reg = ScopeRegistry::default();
+        assert_eq!(
+            resolve_placement(&Placement::Here, ScopeDefault::Global, &reg, &deep, None).unwrap(),
+            Target::NewAt(canonical.clone())
+        );
+
+        let reg = ScopeRegistry::from_scopes(vec![Scope {
+            id: "proj".into(),
+            path: canonical.display().to_string(),
+            created_at: "t".into(),
+        }]);
+        assert_eq!(
+            resolve_placement(&Placement::Here, ScopeDefault::Global, &reg, &deep, None).unwrap(),
+            Target::Existing("proj".into())
+        );
+    }
+
+    #[test]
+    fn here_uses_cwd_outside_a_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = ScopeRegistry::default();
+        assert_eq!(
+            resolve_placement(
+                &Placement::Here,
+                ScopeDefault::Global,
+                &reg,
+                dir.path(),
+                Some(dir.path())
+            )
+            .unwrap(),
+            Target::NewAt(dir.path().canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn explicit_flags_win_in_both_modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = ScopeRegistry::from_scopes(vec![Scope {
+            id: "api".into(),
+            path: "/w/api".into(),
+            created_at: "t".into(),
+        }]);
+        for mode in [ScopeDefault::Global, ScopeDefault::Repo] {
+            assert_eq!(
+                resolve_placement(&Placement::Global, mode, &reg, dir.path(), None).unwrap(),
+                Target::Global
+            );
+            assert_eq!(
+                resolve_placement(
+                    &Placement::Scope("api".into()),
+                    mode,
+                    &reg,
+                    dir.path(),
+                    None
+                )
+                .unwrap(),
+                Target::Existing("api".into())
+            );
+        }
+        assert!(
+            resolve_placement(
+                &Placement::Scope("nope".into()),
+                ScopeDefault::Global,
+                &reg,
+                dir.path(),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn placement_parses_from_a_string() {
+        assert_eq!(Placement::parse(""), Placement::Default);
+        assert_eq!(Placement::parse("  "), Placement::Default);
+        assert_eq!(Placement::parse("global"), Placement::Global);
+        assert_eq!(Placement::parse("here"), Placement::Here);
+        assert_eq!(Placement::parse("api"), Placement::Scope("api".into()));
     }
 }
