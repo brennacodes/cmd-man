@@ -56,8 +56,18 @@ const BLOCK_START: &str = "# >>> cmd-man >>>";
 const BLOCK_END: &str = "# <<< cmd-man <<<";
 
 /// Render the generated definitions file for a shell.
+///
+/// Entries whose name is not a plain shell word are dropped rather than
+/// written out: they arrive off disk without having passed `Entry::validate`,
+/// and the name is interpolated unquoted into `alias`, `unalias` and `unset`.
 pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String {
-    let mut globals: Vec<&Entry> = entries.iter().filter(|e| e.scope.is_none()).collect();
+    let entries: Vec<&Entry> = entries.iter().filter(|e| e.has_usable_name()).collect();
+
+    let mut globals: Vec<&Entry> = entries
+        .iter()
+        .copied()
+        .filter(|e| e.scope.is_none())
+        .collect();
     globals.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut out = String::new();
@@ -66,14 +76,14 @@ pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String
         "# Regenerate with: cmd-man reload ({})\n\n",
         shell.as_str()
     ));
-    out.push_str(&render_preamble(shell, &managed_names(entries, scopes)));
+    out.push_str(&render_preamble(shell, &managed_names(&entries, scopes)));
 
     for entry in &globals {
         out.push_str(&render_entry(entry, ""));
         out.push('\n');
     }
 
-    let rendered = rendered_scopes(entries, scopes);
+    let rendered = rendered_scopes(&entries, scopes);
     if rendered.is_empty() {
         out.push_str(RETIRE_DISPATCHER);
         return out;
@@ -93,13 +103,14 @@ pub fn render(shell: Shell, entries: &[Entry], scopes: &ScopeRegistry) -> String
 /// sorted by name. Scopes without entries are skipped so indices stay
 /// contiguous, and entries naming a scope that is not rendered are dropped.
 fn rendered_scopes<'a>(
-    entries: &'a [Entry],
+    entries: &[&'a Entry],
     scopes: &'a ScopeRegistry,
 ) -> Vec<(&'a Scope, Vec<&'a Entry>)> {
     let mut rendered = Vec::new();
     for scope in scopes.render_order() {
         let mut owned: Vec<&Entry> = entries
             .iter()
+            .copied()
             .filter(|e| e.scope.as_deref() == Some(scope.id.as_str()))
             .collect();
         if owned.is_empty() {
@@ -290,7 +301,7 @@ fn render_state_reset(count: usize) -> String {
 /// Every name the generated file may define: the global entries plus the
 /// entries of every rendered scope. An entry whose scope is unknown or was
 /// dropped as a duplicate is never defined, so it contributes nothing.
-fn managed_names(entries: &[Entry], scopes: &ScopeRegistry) -> Vec<String> {
+fn managed_names(entries: &[&Entry], scopes: &ScopeRegistry) -> Vec<String> {
     let rendered: HashSet<&str> = scopes
         .render_order()
         .iter()
@@ -878,22 +889,23 @@ mod tests {
     #[test]
     fn clearing_terminates_option_parsing() {
         // `unalias -a` deletes every alias in the shell, so a name must never
-        // reach a builtin as an option. Store files are hand editable, so the
-        // renderer stays safe even though `Entry::validate` rejects the name.
-        let entries = vec![alias_entry("-a", "echo x")];
+        // reach a builtin as an option.
+        let entries = vec![alias_entry("ll", "ls -lah")];
         let out = render(Shell::Zsh, &entries, &ScopeRegistry::default());
-        assert!(!out.contains("unalias -a 2>/dev/null"), "out was: {out}");
-        assert!(!out.contains("unset -f -a 2>/dev/null"), "out was: {out}");
-        assert_eq!(
-            out.matches("unalias -- -a 2>/dev/null").count(),
-            2,
-            "out was: {out}"
-        );
-        assert_eq!(
-            out.matches("unset -f -- -a 2>/dev/null").count(),
-            2,
-            "out was: {out}"
-        );
+        assert!(out.contains("unalias -- ll 2>/dev/null"), "out was: {out}");
+        assert!(out.contains("unset -f -- ll 2>/dev/null"), "out was: {out}");
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_shell_word_is_never_rendered() {
+        // Store files are hand editable and arrive over backup sync, so a name
+        // reaches the renderer without having passed `Entry::validate`.
+        for bad in ["-a", "x\necho pwned; #", "a;b", "$(id)"] {
+            let entries = vec![alias_entry(bad, "echo x"), alias_entry("ll", "ls -lah")];
+            let out = render(Shell::Zsh, &entries, &ScopeRegistry::default());
+            assert!(!out.contains(bad), "'{bad}' reached the file: {out}");
+            assert!(out.contains("alias ll="), "the good entry was dropped too");
+        }
     }
 
     #[test]

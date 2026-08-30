@@ -12,7 +12,7 @@ use crate::capture::{self, Assessment, CaptureResult};
 use crate::config::Config;
 use crate::model::{CapturePolicy, Entry, EntryKey};
 use crate::paths::{self, Paths};
-use crate::scopes::{self, Placement, Scope, ScopeRegistry, Target};
+use crate::scopes::{self, Placement, Scope, ScopeRegistry, Target, one_line};
 use crate::search::{Filter, search};
 use crate::shell;
 use crate::store::Store;
@@ -117,6 +117,21 @@ impl App {
             self.notices.push(format!(
                 "entries reference unknown scope '{id}'; they are inactive until you \
                  re-create that scope or move them out of it"
+            ));
+        }
+        let mut unusable: Vec<String> = self
+            .store
+            .entries()
+            .iter()
+            .filter(|e| !e.has_usable_name())
+            .map(|e| one_line(&e.name))
+            .collect();
+        unusable.sort();
+        unusable.dedup();
+        for name in unusable {
+            self.notices.push(format!(
+                "alias '{name}' is not a usable shell word and is not defined: \
+                 use letters, digits, '_', '-' and '.'"
             ));
         }
         self

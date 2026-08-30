@@ -279,6 +279,59 @@ fn an_entry_in_an_unknown_scope_warns_and_is_not_rendered() {
     assert!(!zsh.contains("echo ok"), "zsh was: {zsh}");
 }
 
+/// A category file arrives off disk without going through `Entry::validate`,
+/// via a hand edit or a backup sync, and the name is interpolated unquoted
+/// into `alias`, `unalias` and `unset -f`.
+#[test]
+fn an_entry_whose_name_carries_shell_syntax_warns_and_is_not_rendered() {
+    let home = TempDir::new().unwrap();
+    cmd(&home)
+        .args(["add", "ok", "-c", "echo ok", "--desc", "d"])
+        .assert()
+        .success();
+
+    let file = store_dir(&home).join("categories/general.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("name = \"ok\"", "name = \"ok\\necho PWNED_NAME; #\""),
+    )
+    .unwrap();
+
+    cmd(&home)
+        .args(["list"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("not a usable shell word"));
+
+    cmd(&home).args(["reload"]).assert().success();
+    for shell in ["cmd-man.zsh", "cmd-man.bash"] {
+        let text = std::fs::read_to_string(store_dir(&home).join("shell").join(shell)).unwrap();
+        assert!(
+            !text.contains("PWNED_NAME"),
+            "{shell} carried the payload: {text}"
+        );
+    }
+
+    if have_zsh() {
+        let out = std::process::Command::new("zsh")
+            .arg("-c")
+            .arg(format!(
+                "source '{}'",
+                store_dir(&home).join("shell/cmd-man.zsh").display()
+            ))
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!combined.contains("PWNED_NAME"), "zsh ran it: {combined}");
+    }
+}
+
 #[test]
 fn add_here_scopes_the_entry_and_reports_it() {
     let home = TempDir::new().unwrap();

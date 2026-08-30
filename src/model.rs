@@ -122,6 +122,14 @@ impl Entry {
         }
     }
 
+    /// Whether the alias is a plain shell word, and so safe to write verbatim
+    /// into a generated shell file. Entries reach the renderer straight off
+    /// disk, where a hand-edited or synced category file has not been through
+    /// [`Entry::validate`].
+    pub fn has_usable_name(&self) -> bool {
+        is_usable_name(&self.name)
+    }
+
     /// Validate required fields and the shape of the trigger alias.
     ///
     /// The alias must be a usable shell trigger: non-empty, no whitespace, and
@@ -168,6 +176,17 @@ impl Entry {
             self.scope.as_deref().unwrap_or_default()
         )
     }
+}
+
+/// Whether `name` is a plain shell word: the gate the generated shell files
+/// rely on, since a name reaching the renderer off disk never went through
+/// [`Entry::validate`]. Everything `validate` accepts satisfies this.
+pub fn is_usable_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 /// Identifies an entry: a name plus the scope it lives in.
@@ -240,6 +259,31 @@ mod tests {
         for bad in ["", "git sw", "a=b", "wild*card", "semi;colon", "pipe|it"] {
             let e = Entry::new(bad, Kind::Alias, "echo hi", "desc");
             assert!(e.validate().is_err(), "expected '{bad}' to be rejected");
+        }
+    }
+
+    #[test]
+    fn a_name_validate_accepts_is_always_usable() {
+        for good in ["ll", "git-sw", "g_2", "a.b", "x9"] {
+            let e = Entry::new(good, Kind::Alias, "echo hi", "desc");
+            assert!(e.validate().is_ok(), "expected '{good}' to validate");
+            assert!(e.has_usable_name(), "validate accepted unusable '{good}'");
+        }
+    }
+
+    #[test]
+    fn a_name_carrying_shell_syntax_is_not_usable() {
+        for bad in [
+            "",
+            "-a",
+            "x\necho pwned; #",
+            "a;b",
+            "a b",
+            "a'b",
+            "$(id)",
+            "a`id`",
+        ] {
+            assert!(!is_usable_name(bad), "expected '{bad}' to be unusable");
         }
     }
 
