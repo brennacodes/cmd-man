@@ -272,10 +272,29 @@ Run cmd-man against a throwaway store instead of your real `~/.config/cmd-man`:
 CMD_MAN_HOME=$(mktemp -d) cargo run -- list
 ```
 
-There is no CI, so run fmt, clippy, and the tests before opening a pull request.
+CI runs fmt, clippy, and the tests on every pull request and every push to
+`main`; run them locally before opening a pull request.
+
+### Debug build
+
 ```sh
-cargo build                 # debug build
-cargo test                  # unit tests and the end-to-end suites
-cargo fmt                   # format
-cargo clippy --all-targets  # lint
+cargo build
+```
+
+### Unit tests and the end-to-end suites
+
+```sh
+cargo test
+```
+
+### Format
+
+```sh
+cargo fmt
+```
+
+### Lint
+
+```sh
+cargo clippy --all-targets
 ```

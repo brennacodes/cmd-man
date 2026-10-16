@@ -8,18 +8,84 @@ cmd-man is a Rust CLI/TUI (edition 2024) for creating, browsing, and managing sh
 
 ## Commands
 
+### Debug build
+
 ```sh
-cargo build                 # debug build
-cargo run                   # launch the interactive TUI (no subcommand)
-cargo run -- <subcommand>   # exercise a CLI subcommand (add, list, capture, backup, ...)
-cargo install --path .      # install the binary locally
+cargo build
+```
 
-cargo test                  # unit tests + tests/cli.rs end-to-end suite
-cargo test <name>           # run a single test by substring match
-cargo test --test cli       # only the integration tests
+### Launch the interactive TUI (no subcommand)
 
-cargo fmt                   # format (no custom rustfmt config)
-cargo clippy --all-targets  # lint
+```sh
+cargo run
+```
+
+### Exercise a CLI subcommand (add, list, capture, backup, ...)
+
+```sh
+cargo run -- <subcommand>
+```
+
+### Install the binary locally
+
+```sh
+cargo install --path .
+```
+
+### Install the latest release (macOS or Linux, x86_64 or arm64)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brennacodes/cmd-man/main/dist/install.sh | sh
+```
+
+### Install a specific release, or a prerelease
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brennacodes/cmd-man/main/dist/install.sh | CMD_MAN_VERSION=0.1.0 sh
+```
+
+### Install a release into a directory other than `~/.local/bin`
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brennacodes/cmd-man/main/dist/install.sh | CMD_MAN_INSTALL_DIR="$HOME/bin" sh
+```
+
+### Download a release binary by hand
+
+```sh
+gh release download 0.1.0 --repo brennacodes/cmd-man --pattern 'cmd-man-darwin-arm64.tar.gz'
+```
+
+The release assets are `cmd-man-darwin-arm64`, `cmd-man-darwin-x64`, `cmd-man-linux-arm64`, and `cmd-man-linux-x64`, each a `.tar.gz` holding the single `cmd-man` binary.
+
+### Unit tests and every integration suite in tests/
+
+```sh
+cargo test
+```
+
+### Run a single test by substring match
+
+```sh
+cargo test <name>
+```
+
+### Only the tests/cli.rs end-to-end suite
+
+```sh
+cargo test --test cli
+```
+
+### Format (no custom rustfmt config)
+
+```sh
+cargo fmt
+```
+
+### Lint
+
+```sh
+cargo clippy --all-targets
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, shellcheck, actionlint, and the test suite on Linux and macOS; run fmt, clippy, and tests locally before finishing.
