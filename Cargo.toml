@@ -2,6 +2,7 @@
 name = "cmd-man"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -27,3 +28,8 @@ which = "8.0.5"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

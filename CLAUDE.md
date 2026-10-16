@@ -22,7 +22,11 @@ cargo fmt                   # format (no custom rustfmt config)
 cargo clippy --all-targets  # lint
 ```
 
-There is no CI config; run fmt, clippy, and tests locally before finishing.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, shellcheck, actionlint, and the test suite on Linux and macOS; run fmt, clippy, and tests locally before finishing.
+
+## Releasing
+
+Pushing a tag `X.Y.Z` or `X.Y.Z-rc.N` runs `release.yml`: the tag must equal the `Cargo.toml` version (`scripts/check-release-tag.sh`), then the full CI runs, then the four binaries (darwin/linux x arm64/x64) build, and only if every step passes is a GitHub Release published with them attached. `-rc.N` tags become prereleases, which `dist/install.sh` (the curl installer, tested by `tests/install_script.rs`) skips unless `CMD_MAN_VERSION` pins one.
 
 ## Architecture
 

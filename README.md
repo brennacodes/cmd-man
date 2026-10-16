@@ -31,7 +31,18 @@ aliases and functions. Entries you add become real shell definitions, so a store
 
 ## Install
 
-Install directly from GitHub with Cargo (no clone needed):
+Install the latest prebuilt binary for macOS or Linux (x86_64 or arm64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brennacodes/cmd-man/main/dist/install.sh | sh
+```
+
+The binary goes into `~/.local/bin`; set `CMD_MAN_INSTALL_DIR` to put it
+elsewhere, or `CMD_MAN_VERSION` to install a specific release. Every release's
+binaries are also attached to its page on
+[GitHub Releases](https://github.com/brennacodes/cmd-man/releases).
+
+To build from source instead, install directly from GitHub with Cargo:
 
 ```sh
 cargo install --git https://github.com/brennacodes/cmd-man.git
