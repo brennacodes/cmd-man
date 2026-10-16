@@ -390,11 +390,14 @@ const REFUSED_BODIES: &[&str] = &[
     "echo a\n| grep x",
     "echo a\n; echo b",
     "cat <<EOF\nx\nEOF\n| grep y",
-    "echo a && !",
     "if then echo x; fi",
     "while do echo a; done",
     "case $1 in ;; esac",
 ];
+
+/// Bodies the lint refuses because bash 3.2, the bash macOS ships, breaks on them
+/// while bash 4+ and zsh read them. They can only be proven against a bash 3.
+const BASH3_ONLY_REFUSED_BODIES: &[&str] = &["echo a && !"];
 
 /// The other half of the function-body lint: a body it accepts has to survive
 /// being rendered. Asserting only that `body_problem` returns `None` cannot see
@@ -506,29 +509,45 @@ fn a_refused_function_body_damages_a_real_shell() {
     }
     let dir = TempDir::new().unwrap();
     for (n, body) in REFUSED_BODIES.iter().enumerate() {
-        assert!(
-            cmd_man::lint::body_problem(body).is_some(),
-            "body was: {body:?}"
-        );
-        let file = dir.path().join(format!("probe{n}.sh"));
-        std::fs::write(
-            &file,
-            format!("function probe {{\n{body}\n}}\nfunction sentinel {{\n  echo SENTINEL\n}}\n"),
-        )
-        .unwrap();
-
-        let damaged: Vec<&str> = shells
-            .iter()
-            .copied()
-            .filter(|shell| {
-                run_shell(shell, &file, "echo QUIET\nsentinel\n") != "QUIET\nSENTINEL\n"
-            })
-            .collect();
-        assert!(
-            !damaged.is_empty(),
-            "{body:?} was refused but {shells:?} all sourced it cleanly"
-        );
+        assert_refusal_damages(dir.path(), n, body, &shells);
     }
+}
+
+#[test]
+fn a_bash3_only_refused_function_body_damages_bash_3() {
+    let bash3 = std::process::Command::new("bash")
+        .arg("-c")
+        .arg("echo ${BASH_VERSINFO[0]}")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "3");
+    if !bash3 {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    for (n, body) in BASH3_ONLY_REFUSED_BODIES.iter().enumerate() {
+        assert_refusal_damages(dir.path(), n, body, &["bash"]);
+    }
+}
+
+fn assert_refusal_damages(dir: &Path, n: usize, body: &str, shells: &[&str]) {
+    assert!(
+        cmd_man::lint::body_problem(body).is_some(),
+        "body was: {body:?}"
+    );
+    let file = dir.join(format!("probe{n}.sh"));
+    std::fs::write(
+        &file,
+        format!("function probe {{\n{body}\n}}\nfunction sentinel {{\n  echo SENTINEL\n}}\n"),
+    )
+    .unwrap();
+
+    let damaged = shells
+        .iter()
+        .any(|shell| run_shell(shell, &file, "echo QUIET\nsentinel\n") != "QUIET\nSENTINEL\n");
+    assert!(
+        damaged,
+        "{body:?} was refused but {shells:?} all sourced it cleanly"
+    );
 }
 
 #[test]

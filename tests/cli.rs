@@ -1188,3 +1188,173 @@ fn import_reports_a_body_only_one_shell_reads() {
     let all = app_entries(&home);
     assert_eq!(all.iter().filter(|e| e.name == "fallthru").count(), 1);
 }
+
+/// Runs `cmd-man capture` with `args` and returns its stdout when the command ran
+/// inside the sandbox. A run that fell back to an unsandboxed subprocess returns
+/// `None` so the caller can skip, unless `CMD_MAN_REQUIRE_SANDBOX=1` demands the
+/// sandbox, as CI does.
+fn sandboxed_capture(home: &TempDir, args: &[&str]) -> Option<String> {
+    let output = cmd(home)
+        .arg("capture")
+        .args(args)
+        .arg("--yes")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "capture failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if stdout.contains("Captured via sandbox backend.") {
+        return Some(stdout);
+    }
+    assert_ne!(
+        std::env::var("CMD_MAN_REQUIRE_SANDBOX").as_deref(),
+        Ok("1"),
+        "the sandbox was required but the capture fell back: {stdout}"
+    );
+    None
+}
+
+fn add_entry(home: &TempDir, name: &str, command: &str) {
+    cmd(home)
+        .args(["add", name, "-c", command, "--desc", name])
+        .assert()
+        .success();
+}
+
+fn example_output(home: &TempDir, name: &str) -> String {
+    app_entries(home)
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap()
+        .example_output
+}
+
+#[test]
+fn sandboxed_capture_cannot_write_outside_temporary_directories() {
+    let home = TempDir::new().unwrap();
+    let outside = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let target = outside.path().join("escaped");
+    add_entry(
+        &home,
+        "escape",
+        &format!("touch '{}'; echo finished", target.display()),
+    );
+
+    if sandboxed_capture(&home, &["escape"]).is_none() {
+        return;
+    }
+
+    assert!(!target.exists(), "the sandboxed command wrote {target:?}");
+    assert!(example_output(&home, "escape").contains("finished"));
+}
+
+#[test]
+fn sandboxed_capture_cannot_reach_the_network() {
+    let have_curl = std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !have_curl {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let home = TempDir::new().unwrap();
+    add_entry(
+        &home,
+        "phone-home",
+        &format!("curl -s --max-time 2 http://127.0.0.1:{port}/; echo finished"),
+    );
+
+    if sandboxed_capture(&home, &["phone-home"]).is_none() {
+        return;
+    }
+
+    let accepted = listener.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the sandboxed command connected to the listener: {accepted:?}"
+    );
+}
+
+#[test]
+fn sandboxed_capture_kills_everything_the_command_started_on_timeout() {
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(store_dir(&home)).unwrap();
+    std::fs::write(
+        store_dir(&home).join("config.toml"),
+        "[capture]\ntimeout_secs = 1\n",
+    )
+    .unwrap();
+    let marker = home.path().join("survived");
+    add_entry(
+        &home,
+        "linger",
+        &format!("(sleep 2; touch '{}') & sleep 30", marker.display()),
+    );
+
+    let started = std::time::Instant::now();
+    let Some(stdout) = sandboxed_capture(&home, &["linger"]) else {
+        return;
+    };
+
+    assert!(stdout.contains("timed out"), "stdout was: {stdout}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !marker.exists(),
+        "a background process outlived the timeout"
+    );
+}
+
+#[test]
+fn sandboxed_capture_of_a_scoped_entry_runs_in_the_scope_directory() {
+    let home = TempDir::new().unwrap();
+    let api = home.path().join("work/api");
+    std::fs::create_dir_all(&api).unwrap();
+    cmd_in(&home, &api)
+        .args([
+            "add",
+            "where",
+            "-c",
+            "pwd; /bin/pwd",
+            "--desc",
+            "w",
+            "--here",
+        ])
+        .assert()
+        .success();
+
+    if sandboxed_capture(&home, &["where", "--in", "api"]).is_none() {
+        return;
+    }
+
+    let output = example_output(&home, "where");
+    assert_eq!(
+        output.lines().filter(|l| l.ends_with("work/api")).count(),
+        2,
+        "output was: {output}"
+    );
+}
+
+#[test]
+fn capture_returns_when_the_command_exits_even_if_it_backgrounded_something() {
+    let home = TempDir::new().unwrap();
+    add_entry(&home, "spawner", "sleep 30 & echo hello-spawner");
+
+    let started = std::time::Instant::now();
+    cmd(&home)
+        .args(["capture", "spawner", "--yes"])
+        .assert()
+        .success();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "capture waited on a backgrounded process"
+    );
+    assert!(example_output(&home, "spawner").contains("hello-spawner"));
+}
