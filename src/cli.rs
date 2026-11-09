@@ -87,6 +87,8 @@ enum Command {
     Backup,
     /// Restore the store from the GitHub backup.
     Restore,
+    /// Commit, pull, and push your backup now.
+    Sync,
 }
 
 #[derive(Subcommand)]
@@ -222,12 +224,7 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::resolve().ok();
 
-    // Report a previous background sync failure once, without blocking anything.
-    if let Some(paths) = &paths
-        && let Some(notice) = backup::take_failure_notice(paths)
-    {
-        eprintln!("{notice}");
-    }
+    let in_tui = cli.command.is_none();
 
     let result = match cli.command {
         None => crate::tui::run(),
@@ -237,7 +234,20 @@ pub fn run() -> Result<()> {
     // Kick off this invocation's sync after the command has settled on disk, so a
     // single background pass covers the pull and any pushes from this run.
     if let Some(paths) = &paths {
-        backup::spawn_sync(paths);
+        let changed = backup::change_sync_started();
+        if !changed {
+            backup::spawn_sync(paths);
+        }
+        let report = if in_tui {
+            None
+        } else if changed {
+            backup::await_change_sync(paths)
+        } else {
+            backup::take_failure_notice(paths)
+        };
+        if let Some(report) = report {
+            eprintln!("{report}");
+        }
     }
     result
 }
@@ -266,6 +276,7 @@ fn dispatch(cmd: Command) -> Result<()> {
         Command::Reload => cmd_reload(),
         Command::Backup => cmd_backup(),
         Command::Restore => cmd_restore(),
+        Command::Sync => cmd_sync(),
     }
 }
 
@@ -488,6 +499,7 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
         .find(&key)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no entry '{}'", key.label()))?;
+    let seen = entry.clone();
 
     if let Some(c) = args.command {
         entry.command = c;
@@ -515,7 +527,7 @@ fn cmd_edit(args: EditArgs) -> Result<()> {
         app.fill_from_help(&mut entry);
     }
 
-    let new_key = app.update(&key, entry, placement.as_ref())?;
+    let new_key = app.update_if_unchanged(&key, &seen, entry, placement.as_ref())?;
     println!("Updated '{}'.", new_key.label());
     print_exclusions(&app, &new_key);
     print_reload_hint(&app);
@@ -703,20 +715,24 @@ fn cmd_import(yes: bool) -> Result<()> {
     }
     println!("Found {} unmanaged definition(s).", candidates.len());
 
-    let mut keys = Vec::new();
-    for entry in candidates {
-        let accept = yes
-            || confirm(&format!(
+    let accepted: Vec<Entry> = candidates
+        .into_iter()
+        .filter(|entry| {
+            yes || confirm(&format!(
                 "Import {} '{}' = {}?",
                 entry.kind, entry.name, entry.command
-            ));
-        if accept {
-            let key = EntryKey::of(&entry);
-            let name = entry.name.clone();
-            match app.store.add(entry) {
-                Ok(()) => keys.push(key),
-                Err(e) => eprintln!("Skipped '{name}': {e}"),
-            }
+            ))
+        })
+        .collect();
+
+    let _store_lock = app.begin_mutation()?;
+    let mut keys = Vec::new();
+    for entry in accepted {
+        let key = EntryKey::of(&entry);
+        let name = entry.name.clone();
+        match app.store.add(entry) {
+            Ok(()) => keys.push(key),
+            Err(e) => eprintln!("Skipped '{name}': {e}"),
         }
     }
     if !keys.is_empty() {
@@ -769,6 +785,36 @@ fn cmd_backup() -> Result<()> {
     if report.pushed {
         println!("Backup complete via {} method.", method_name(report.method));
     }
+    Ok(())
+}
+
+fn cmd_sync() -> Result<()> {
+    let app = load_app()?;
+    let mut config = app.config.clone();
+    config.backup.auto_sync = true;
+    let mut finished = None;
+    for _ in 0..3 {
+        if !backup::await_sync_idle(&app.paths) {
+            break;
+        }
+        let timestamp = now_timestamp();
+        backup::run_sync(&app.paths, &config, &timestamp)?;
+        finished =
+            backup::read_status(&app.paths).filter(|status| status.last_attempt == timestamp);
+        if finished.is_some() {
+            break;
+        }
+    }
+    let Some(status) = finished else {
+        anyhow::bail!("another backup sync is still running; run `cmd-man sync` again shortly");
+    };
+    if status.found_no_remote() {
+        anyhow::bail!("no backup remote is set up; run `cmd-man backup` to create one");
+    }
+    if let Some(report) = backup::claim_failure_report(&app.paths, &status) {
+        anyhow::bail!("{}", report.trim_start_matches("cmd-man: "));
+    }
+    println!("Backup is in sync.");
     Ok(())
 }
 

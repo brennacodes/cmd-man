@@ -234,13 +234,19 @@ demand, or pass `--no-help` to `add`/`edit` to skip the lookup.
 ## Sync and backups
 
 Once a backup remote is reachable, cmd-man keeps your entries synced
-automatically, in the background, without ever blocking you. A remote is reachable
+automatically, starting a sync as soon as your data changes. A remote is reachable
 when `backup.remote_url` is set, when `gh` is installed and authenticated, or when
 a GitHub OAuth token is already stored. On a new machine, the first run clones your
 existing backup and sets up your shell files, so your aliases travel with you.
 
 Sync is on by default. Turn it off with `auto_sync = false` under `[backup]` in
 your config, or set `CMD_MAN_DISABLE_SYNC=1` for a single run.
+
+If a sync fails, cmd-man tells you what happened, when, where, what it means for
+your data, and how to fix it. You see this in the TUI if you are using it, in the
+command that made the change (which waits up to 10 seconds for its sync), and
+otherwise the next time you use cmd-man. Run `cmd-man sync`, or press `S` in the
+TUI, to sync right away.
 
 `cmd-man backup` and `cmd-man restore` are the manual equivalents. Both use a
 private `cmd-man-backup` repository and pick the best available method for you;

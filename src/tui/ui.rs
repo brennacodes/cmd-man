@@ -50,6 +50,7 @@ pub fn draw(frame: &mut Frame, state: &UiState, form: Option<&Form>) {
     match &state.mode {
         Mode::Help => draw_help(frame),
         Mode::Confirm { message, .. } => draw_confirm(frame, message),
+        Mode::SyncFailure { report } => draw_sync_failure(frame, report, state.popup_scroll),
         _ => {}
     }
     if let Some(form) = form {
@@ -215,9 +216,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, state: &UiState) {
 fn draw_status(frame: &mut Frame, area: Rect, state: &UiState) {
     let hints = match state.mode {
         Mode::Search => "type to filter  Enter/Esc: done",
-        _ => {
-            "/ search  j/k move  Tab kind  g category  s scope  a add  e edit  d delete  c capture  r reload  b backup  ? help  q quit"
-        }
+        _ => "/ search  a add  e edit  d delete  s scope  S sync  ? help  q quit",
     };
     let line = Line::from(vec![
         Span::styled(
@@ -248,6 +247,32 @@ fn draw_confirm(frame: &mut Frame, message: &str) {
     );
 }
 
+fn draw_sync_failure(frame: &mut Frame, report: &str, scroll: u16) {
+    let area = centered(80, 70, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Backup sync failed ")
+        .border_style(Style::default().fg(WARN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let lines: Vec<Line> = report.lines().map(|l| Line::from(l.to_string())).collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "S: sync now    j/k: scroll    Esc/Enter: close",
+            label_style(),
+        )),
+        rows[1],
+    );
+}
+
 fn draw_help(frame: &mut Frame) {
     let area = centered(70, 70, frame.area());
     frame.render_widget(Clear, area);
@@ -268,6 +293,7 @@ fn draw_help(frame: &mut Frame) {
         help_row("c", "capture example output"),
         help_row("r", "regenerate shell files"),
         help_row("b", "back up to GitHub"),
+        help_row("S", "sync your backup now"),
         help_row("?", "toggle this help"),
         help_row("q / Esc", "quit"),
     ];
@@ -518,6 +544,39 @@ mod tests {
         })
         .unwrap();
         rows(term.backend().buffer())
+    }
+
+    #[test]
+    fn the_sync_failure_popup_shows_the_report_and_how_to_retry() {
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|frame| draw_sync_failure(frame, "first line\n  Fix: do this", 0))
+            .unwrap();
+        let screen = rows(term.backend().buffer()).join("\n");
+        assert!(screen.contains("Backup sync failed"), "{screen}");
+        assert!(screen.contains("first line"), "{screen}");
+        assert!(screen.contains("Fix: do this"), "{screen}");
+        assert!(screen.contains("S: sync now"), "{screen}");
+    }
+
+    #[test]
+    fn the_popup_keeps_its_actions_on_screen_when_the_report_overflows() {
+        let long = "a line of the report that goes on for a while\n".repeat(30);
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        term.draw(|frame| draw_sync_failure(frame, &long, 0))
+            .unwrap();
+        let screen = rows(term.backend().buffer()).join("\n");
+        assert!(screen.contains("Esc/Enter: close"), "{screen}");
+    }
+
+    #[test]
+    fn scrolling_the_popup_reveals_later_lines() {
+        let report: String = (0..40).map(|n| format!("line-{n}\n")).collect();
+        let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        term.draw(|frame| draw_sync_failure(frame, &report, 30))
+            .unwrap();
+        let screen = rows(term.backend().buffer()).join("\n");
+        assert!(screen.contains("line-30"), "{screen}");
+        assert!(!screen.contains("line-0 "), "{screen}");
     }
 
     #[test]

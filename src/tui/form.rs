@@ -15,6 +15,8 @@ pub struct Form {
     pub title: String,
     /// `Some(key)` when editing an existing entry.
     pub original: Option<EntryKey>,
+    /// The entry as it was when an edit form opened.
+    pub opened: Option<Entry>,
     pub fields: Vec<Field>,
     pub focus: usize,
     /// A validation error to show after a failed save attempt.
@@ -96,6 +98,7 @@ impl Form {
         Form {
             title: "Add entry".into(),
             original: None,
+            opened: None,
             fields: Self::blank_fields(),
             focus: 0,
             error: None,
@@ -119,6 +122,7 @@ impl Form {
         Form {
             title: format!("Edit {}", entry.name),
             original: Some(EntryKey::of(entry)),
+            opened: Some(entry.clone()),
             fields,
             focus: 0,
             error: None,
@@ -184,12 +188,25 @@ impl Form {
         let command = self.fields[COMMAND].value.trim().to_string();
         let description = self.fields[DESCRIPTION].value.trim().to_string();
 
-        let mut entry = Entry::new(name, kind, command, description);
+        let blank = Entry::new(name, kind, command, description);
+        // The form only shows some fields; the rest carry over from the entry.
+        let mut entry = match &self.opened {
+            Some(opened) => Entry {
+                name: blank.name.clone(),
+                kind: blank.kind,
+                command: blank.command.clone(),
+                description: blank.description.clone(),
+                ..opened.clone()
+            },
+            None => blank.clone(),
+        };
         entry.scope = self.original.as_ref().and_then(|k| k.scope.clone());
         let category = self.fields[CATEGORY].value.trim();
-        if !category.is_empty() {
-            entry.category = category.to_string();
-        }
+        entry.category = if category.is_empty() {
+            blank.category
+        } else {
+            category.to_string()
+        };
         entry.tags = self.fields[TAGS]
             .value
             .split(',')
@@ -227,6 +244,22 @@ mod tests {
         assert_eq!(entry.name, "gitsw");
         assert_eq!(entry.kind, Kind::Alias);
         assert_eq!(entry.command, "git switch");
+    }
+
+    #[test]
+    fn editing_keeps_the_fields_the_form_does_not_show() {
+        let mut e = Entry::new("deploy", Kind::Alias, "make deploy", "ship it");
+        e.example_output = "shipped".into();
+        e.destructive = true;
+        e.capture_policy = crate::model::CapturePolicy::Never;
+        e.created_at = "2026-01-01T00:00:00Z".into();
+
+        let back = Form::edit(&e).to_entry().unwrap();
+
+        assert_eq!(back.example_output, "shipped");
+        assert!(back.destructive);
+        assert_eq!(back.capture_policy, crate::model::CapturePolicy::Never);
+        assert_eq!(back.created_at, "2026-01-01T00:00:00Z");
     }
 
     #[test]

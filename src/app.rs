@@ -1,7 +1,10 @@
 //! Service layer shared by the CLI and TUI: loads state and centralizes every
 //! mutation so the store and generated shell files stay in sync.
 
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -15,7 +18,7 @@ use crate::paths::{self, Paths};
 use crate::scopes::{self, Placement, Scope, ScopeRegistry, Target, one_line};
 use crate::search::{Filter, search};
 use crate::shell;
-use crate::store::Store;
+use crate::store::{Store, StoreLock};
 
 /// How a command names which entry it means when a name exists more than once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +78,26 @@ pub struct App {
     pub home: Option<PathBuf>,
     /// Messages worth showing the user once, collected while loading state.
     pub notices: Vec<String>,
+    /// What the store and scope files held when this state last matched them.
+    disk_fingerprint: Cell<u64>,
+}
+
+fn disk_fingerprint(paths: &Paths) -> u64 {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(paths.categories_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    files.sort();
+    files.push(paths.scopes_file());
+    let mut hasher = DefaultHasher::new();
+    for file in files {
+        file.hash(&mut hasher);
+        std::fs::read(&file).ok().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl App {
@@ -82,6 +105,7 @@ impl App {
     pub fn load() -> Result<Self> {
         let paths = Paths::resolve()?;
         let config = Config::load(&paths)?;
+        let fingerprint = disk_fingerprint(&paths);
         let store = Store::load(&paths)?;
         let scopes = ScopeRegistry::load(&paths)?;
         let app = App {
@@ -92,6 +116,7 @@ impl App {
             cwd: process_cwd(),
             home: paths::home_dir(),
             notices: Vec::new(),
+            disk_fingerprint: Cell::new(fingerprint),
         };
         Ok(app.finish_load())
     }
@@ -151,6 +176,7 @@ impl App {
 
     /// Construct from explicit parts (used in tests).
     pub fn with(paths: Paths, config: Config, store: Store) -> Self {
+        let fingerprint = disk_fingerprint(&paths);
         App {
             paths,
             config,
@@ -159,7 +185,32 @@ impl App {
             cwd: process_cwd(),
             home: paths::home_dir(),
             notices: Vec::new(),
+            disk_fingerprint: Cell::new(fingerprint),
         }
+    }
+
+    /// Take the store lock and catch up with disk. Hold the result until the
+    /// mutation has persisted.
+    pub fn begin_mutation(&mut self) -> Result<StoreLock> {
+        let lock = StoreLock::acquire(&self.paths)?;
+        self.reload_if_changed()?;
+        Ok(lock)
+    }
+
+    /// Replace in-memory state with what is on disk if a sync or another process
+    /// has changed it, returning whether it did. Saving writes the whole store,
+    /// so a mutation made on stale state would delete whatever arrived since.
+    pub fn reload_if_changed(&mut self) -> Result<bool> {
+        let current = disk_fingerprint(&self.paths);
+        if current == self.disk_fingerprint.get() {
+            return Ok(false);
+        }
+        let store = Store::load(&self.paths)?;
+        let scopes = ScopeRegistry::load(&self.paths)?;
+        self.store = store;
+        self.scopes = scopes;
+        self.disk_fingerprint.set(current);
+        Ok(true)
     }
 
     /// Replace the scope registry.
@@ -184,10 +235,18 @@ impl App {
     /// files, then kick off a background sync so the change is committed and
     /// pushed.
     pub fn persist(&self) -> Result<()> {
-        self.store.save(&self.paths)?;
-        self.scopes.save(&self.paths)?;
+        let saved = self
+            .store
+            .save(&self.paths)
+            .and_then(|()| self.scopes.save(&self.paths));
+        if let Err(e) = saved {
+            // Memory now holds a change disk does not, so force the next reread.
+            self.disk_fingerprint.set(!disk_fingerprint(&self.paths));
+            return Err(e);
+        }
+        self.disk_fingerprint.set(disk_fingerprint(&self.paths));
         self.regenerate_shells()?;
-        crate::backup::spawn_sync(&self.paths);
+        crate::backup::spawn_change_sync(&self.paths);
         Ok(())
     }
 
@@ -319,6 +378,7 @@ impl App {
     /// other being [`App::update`]: the store accepts the entry first, so a
     /// rejected entry leaves no scope behind.
     pub fn add(&mut self, mut entry: Entry, placement: &Placement) -> Result<EntryKey> {
+        let _store_lock = self.begin_mutation()?;
         let pending = match self.resolve_target(placement)? {
             Target::Global => {
                 entry.scope = None;
@@ -348,6 +408,42 @@ impl App {
     /// Creates a scope under the same rule as [`App::add`]: the store accepts
     /// the entry first, so a rejected move leaves no scope behind.
     pub fn update(
+        &mut self,
+        key: &EntryKey,
+        entry: Entry,
+        placement: Option<&Placement>,
+    ) -> Result<EntryKey> {
+        let _store_lock = self.begin_mutation()?;
+        self.apply_update(key, entry, placement)
+    }
+
+    /// [`App::update`] that refuses if the entry no longer matches `seen`, the
+    /// version the user started editing, rather than reverting a newer change.
+    pub fn update_if_unchanged(
+        &mut self,
+        key: &EntryKey,
+        seen: &Entry,
+        entry: Entry,
+        placement: Option<&Placement>,
+    ) -> Result<EntryKey> {
+        let _store_lock = self.begin_mutation()?;
+        match self.store.find(key) {
+            Some(current) if current == seen => {}
+            Some(_) => bail!(
+                "'{}' changed while you were editing it, so this edit was not saved; \
+                 cancel and edit it again to start from the new version",
+                key.label()
+            ),
+            None => bail!(
+                "'{}' was removed while you were editing it, so this edit was not saved; \
+                 add it again if you still want it",
+                key.label()
+            ),
+        }
+        self.apply_update(key, entry, placement)
+    }
+
+    fn apply_update(
         &mut self,
         key: &EntryKey,
         mut entry: Entry,
@@ -407,6 +503,7 @@ impl App {
 
     /// Remove an entry and persist.
     pub fn remove(&mut self, key: &EntryKey) -> Result<Entry> {
+        let _store_lock = self.begin_mutation()?;
         let removed = self.store.remove(key)?;
         self.persist()?;
         Ok(removed)
@@ -443,6 +540,7 @@ impl App {
     /// unknown id is created rather than rejected: this is how an entry whose
     /// scope went missing is made live again.
     pub fn relocate_scope(&mut self, id: &str, dir: &Path) -> Result<()> {
+        let _store_lock = self.begin_mutation()?;
         let id = id.trim();
         if id.is_empty() {
             bail!("a scope id is required");
@@ -492,6 +590,7 @@ impl App {
     /// name is checked first so a collision leaves the scope exactly as it
     /// was rather than promoting half of it.
     pub fn remove_scope_promoting(&mut self, id: &str) -> Result<usize> {
+        let _store_lock = self.begin_mutation()?;
         let entries = self.scope_entries_to_move(id)?;
         let mut collisions: Vec<&str> = entries
             .iter()
@@ -517,6 +616,7 @@ impl App {
 
     /// Remove a scope along with every entry in it, and persist.
     pub fn remove_scope_deleting(&mut self, id: &str) -> Result<usize> {
+        let _store_lock = self.begin_mutation()?;
         let entries = self.scope_entries_to_move(id)?;
         for entry in &entries {
             self.store.remove(&EntryKey::of(entry))?;
@@ -618,6 +718,7 @@ impl App {
         output: String,
         destructive: bool,
     ) -> Result<()> {
+        let _store_lock = self.begin_mutation()?;
         let mut entry = self
             .store
             .find(key)
@@ -630,7 +731,7 @@ impl App {
                 entry.capture_policy = CapturePolicy::Confirm;
             }
         }
-        self.update(key, entry, None).map(|_| ())
+        self.apply_update(key, entry, None).map(|_| ())
     }
 }
 
@@ -686,6 +787,264 @@ mod tests {
 
     fn test_app(dir: &tempfile::TempDir) -> App {
         test_app_with(dir, Config::default())
+    }
+
+    fn entry_in(name: &str, category: &str) -> Entry {
+        let mut entry = Entry::new(name, Kind::Alias, "echo hi", "d");
+        entry.category = category.to_string();
+        entry
+    }
+
+    /// What a pull or a first clone does: new files appear behind a running app.
+    fn sync_lands(dir: &tempfile::TempDir, entries: Vec<Entry>) {
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        let mut store = Store::default();
+        for entry in entries {
+            store.add(entry).unwrap();
+        }
+        store.save(&paths).unwrap();
+    }
+
+    #[test]
+    fn a_save_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        sync_lands(&dir, vec![entry_in("pulled", "work")]);
+
+        app.add(entry_in("mine", "general"), &Placement::Global)
+            .unwrap();
+
+        let on_disk = Store::load(&app.paths).unwrap();
+        assert!(on_disk.find(&EntryKey::global("pulled")).is_some());
+        assert!(on_disk.find(&EntryKey::global("mine")).is_some());
+        assert!(app.paths.categories_dir().join("work.toml").exists());
+    }
+
+    #[test]
+    fn a_removal_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        app.add(entry_in("old", "general"), &Placement::Global)
+            .unwrap();
+        sync_lands(
+            &dir,
+            vec![entry_in("old", "general"), entry_in("pulled", "work")],
+        );
+
+        app.remove(&EntryKey::global("old")).unwrap();
+
+        let on_disk = Store::load(&app.paths).unwrap();
+        assert!(on_disk.find(&EntryKey::global("pulled")).is_some());
+        assert!(on_disk.find(&EntryKey::global("old")).is_none());
+    }
+
+    /// An app holding `old`, a scope `api` containing `scoped`, and a sync that
+    /// has just brought in `pulled` behind its back.
+    fn app_behind_a_sync(dir: &tempfile::TempDir) -> App {
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut app = test_app(dir);
+        app.relocate_scope("api", &work).unwrap();
+        let mut scoped = entry_in("scoped", "general");
+        scoped.scope = Some("api".into());
+        sync_lands(dir, vec![entry_in("old", "general"), scoped.clone()]);
+        app.reload_if_changed().unwrap();
+        sync_lands(
+            dir,
+            vec![
+                entry_in("old", "general"),
+                scoped,
+                entry_in("pulled", "work"),
+            ],
+        );
+        app
+    }
+
+    fn pulled_survived(app: &App) -> bool {
+        Store::load(&app.paths)
+            .unwrap()
+            .find(&EntryKey::global("pulled"))
+            .is_some()
+    }
+
+    #[test]
+    fn an_update_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_behind_a_sync(&dir);
+        app.update(&EntryKey::global("old"), entry_in("old", "general"), None)
+            .unwrap();
+        assert!(pulled_survived(&app));
+    }
+
+    #[test]
+    fn recording_a_capture_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_behind_a_sync(&dir);
+        app.record_capture(&EntryKey::global("old"), "out".into(), false)
+            .unwrap();
+        assert!(pulled_survived(&app));
+    }
+
+    #[test]
+    fn relocating_a_scope_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_behind_a_sync(&dir);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        app.relocate_scope("api", &elsewhere).unwrap();
+        assert!(pulled_survived(&app));
+    }
+
+    #[test]
+    fn promoting_a_scope_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_behind_a_sync(&dir);
+        app.remove_scope_promoting("api").unwrap();
+        assert!(pulled_survived(&app));
+    }
+
+    #[test]
+    fn deleting_a_scope_on_stale_state_keeps_what_a_sync_brought_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_behind_a_sync(&dir);
+        app.remove_scope_deleting("api").unwrap();
+        assert!(pulled_survived(&app));
+    }
+
+    #[test]
+    fn a_reload_that_cannot_read_the_scopes_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        sync_lands(&dir, vec![entry_in("pulled", "work")]);
+        std::fs::write(app.paths.scopes_file(), "not [valid").unwrap();
+
+        assert!(app.reload_if_changed().is_err());
+        assert!(app.store.entries().is_empty());
+    }
+
+    #[test]
+    fn an_edit_of_a_version_that_has_since_changed_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let key = app
+            .add(entry_in("deploy", "general"), &Placement::Global)
+            .unwrap();
+        let seen = app.store.find(&key).unwrap().clone();
+
+        let mut pulled = entry_in("deploy", "general");
+        pulled.command = "echo new".into();
+        sync_lands(&dir, vec![pulled]);
+
+        let err = app
+            .update_if_unchanged(&key, &seen, seen.clone(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("changed while"), "{err}");
+        let on_disk = Store::load(&app.paths).unwrap();
+        assert_eq!(on_disk.find(&key).unwrap().command, "echo new");
+    }
+
+    #[test]
+    fn an_edit_of_a_removed_entry_says_it_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let key = app
+            .add(entry_in("deploy", "general"), &Placement::Global)
+            .unwrap();
+        let seen = app.store.find(&key).unwrap().clone();
+        sync_lands(&dir, vec![entry_in("other", "general")]);
+
+        let err = app
+            .update_if_unchanged(&key, &seen, seen.clone(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("was removed"), "{err}");
+    }
+
+    #[test]
+    fn an_edit_of_the_current_version_goes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let key = app
+            .add(entry_in("deploy", "general"), &Placement::Global)
+            .unwrap();
+        let seen = app.store.find(&key).unwrap().clone();
+        let mut edited = seen.clone();
+        edited.description = "new words".into();
+
+        app.update_if_unchanged(&key, &seen, edited, None).unwrap();
+        assert_eq!(app.store.find(&key).unwrap().description, "new words");
+    }
+
+    #[test]
+    fn a_save_that_fails_does_not_leave_the_change_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        app.paths.ensure_dirs().unwrap();
+        let blocker = app.paths.categories_dir().join(".store-write.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+
+        assert!(
+            app.add(entry_in("ghost", "general"), &Placement::Global)
+                .is_err()
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+
+        assert!(app.reload_if_changed().unwrap());
+        assert!(app.store.entries().is_empty());
+        app.add(entry_in("ghost", "general"), &Placement::Global)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_mutation_waits_for_the_store_lock_and_gives_up_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let held = StoreLock::acquire(&app.paths).unwrap();
+        let err = app
+            .add(entry_in("mine", "general"), &Placement::Global)
+            .unwrap_err();
+        assert!(err.to_string().contains("try again"), "{err}");
+        drop(held);
+        app.add(entry_in("mine", "general"), &Placement::Global)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_change_to_the_scope_file_is_picked_up_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let mut registry = ScopeRegistry::default();
+        registry.insert(Scope {
+            id: "api".into(),
+            path: "$HOME/api".into(),
+            created_at: String::new(),
+        });
+        registry.save(&app.paths).unwrap();
+
+        assert!(app.reload_if_changed().unwrap());
+        assert!(app.scopes.find("api").is_some());
+    }
+
+    #[test]
+    fn nothing_reloads_when_only_this_app_has_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        app.add(entry_in("mine", "general"), &Placement::Global)
+            .unwrap();
+        assert!(!app.reload_if_changed().unwrap());
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_refuses_the_save_instead_of_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app(&dir);
+        let broken = app.paths.categories_dir().join("work.toml");
+        std::fs::write(&broken, "not [valid").unwrap();
+
+        assert!(
+            app.add(entry_in("mine", "general"), &Placement::Global)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "not [valid");
     }
 
     #[test]

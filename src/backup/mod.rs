@@ -12,12 +12,15 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{BackupConfig, BackupMethod, Config};
 use crate::paths::Paths;
+use crate::scopes::ScopeRegistry;
+use crate::store::{Store, StoreLock};
 
 use git::GitRepo;
 pub use plan::{Availability, BackupPlan, new_repo_link, plan_backup, remote_https_url};
 pub use sync::{
-    SYNC_EXEC_ARG, SyncStatus, read_status, run_sync, spawn_sync, sync_exec_main,
-    take_failure_notice,
+    SYNC_EXEC_ARG, SyncStatus, await_change_sync, await_sync_idle, change_sync_started,
+    claim_failure_report, last_sync_attempt, read_status, run_sync, spawn_change_sync, spawn_sync,
+    sync_exec_main, take_failure_notice,
 };
 
 /// Human-facing outcome of a backup run.
@@ -55,9 +58,61 @@ pub fn prepare_repo(paths: &Paths) -> Result<GitRepo> {
         ".sync.lock",
         ".sync-state.toml",
         ".sync-notified",
+        ".sync-regen-pending",
+        ".sync-report-pending",
+        ".sync-rerun",
+        ".sync-bootstrap-pending",
+        ".store.lock",
+        ".store-write.tmp",
         ".sync-clone/",
     ])?;
+    repo.ensure_gitignore_merges_by_union()?;
     Ok(repo)
+}
+
+/// Stage a consistent view of the store, then commit without holding the store
+/// lock, since the user's hooks and signing can take arbitrarily long.
+fn commit_snapshot(paths: &Paths, repo: &GitRepo, timestamp: &str) -> Result<bool> {
+    let staged = {
+        let _store_lock = StoreLock::acquire(paths)?;
+        repo.stage_all()?
+    };
+    if staged {
+        repo.commit_staged(&commit_subject(timestamp))?;
+    }
+    Ok(staged)
+}
+
+/// Merge the last fetch under the store lock and commit the result outside it.
+/// A failed merge is aborted so local content is preserved.
+fn merge_fetched_safely(paths: &Paths, repo: &GitRepo) -> Result<()> {
+    {
+        let _store_lock = StoreLock::acquire(paths)?;
+        let merged = repo.merge_fetched().and_then(|()| {
+            Store::load(paths)
+                .and_then(|_| ScopeRegistry::load(paths))
+                .map(|_| ())
+                .context("the backup cannot be merged with this machine")
+        });
+        if let Err(e) = merged {
+            let _ = repo.abort_merge();
+            return Err(e);
+        }
+    }
+    if let Err(e) = repo.conclude_merge() {
+        let _store_lock = StoreLock::acquire(paths)?;
+        // Aborting would restore a file a save has deleted since the merge. Left
+        // open, the merge concludes with the next commit instead.
+        if repo.tree_matches_index() {
+            let _ = repo.abort_merge();
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn commit_subject(timestamp: &str) -> String {
+    format!("Back up cmd-man store {timestamp}")
 }
 
 /// Run a backup, choosing the tier from config + availability.
@@ -67,7 +122,7 @@ pub fn run_backup(paths: &Paths, config: &Config, timestamp: &str) -> Result<Bac
     let mut messages = vec![selected.reason.clone()];
 
     let repo = prepare_repo(paths)?;
-    let committed = repo.commit_all(&format!("cmd-man backup {timestamp}"))?;
+    let committed = commit_snapshot(paths, &repo, timestamp)?;
 
     let pushed = match selected.method {
         BackupMethod::Gh => push_via_gh(&repo, &config.backup, &avail, &mut messages)?,
@@ -219,7 +274,8 @@ pub fn run_restore(paths: &Paths, config: &Config) -> Result<Vec<String>> {
     let repo = GitRepo::new(paths.root().clone());
     if repo.is_initialized() {
         repo.set_remote("origin", &url)?;
-        repo.pull("origin", "main")?;
+        repo.fetch("origin", "main")?;
+        merge_fetched_safely(paths, &repo)?;
         messages.push(format!("pulled latest from {url}"));
     } else {
         git::clone(&url, paths.root())?;

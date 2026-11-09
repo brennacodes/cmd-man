@@ -75,8 +75,7 @@ impl ScopeRegistry {
         };
         let text = toml::to_string_pretty(&file).context("serializing scopes")?;
         let path = paths.scopes_file();
-        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        crate::store::write_atomic(&path, &text)
     }
 
     /// Problems found in the loaded registry, for surfacing as notices.

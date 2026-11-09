@@ -72,6 +72,31 @@ impl Paths {
         self.root.join(".sync-notified")
     }
 
+    /// Marker recording that pulled changes have not reached the shell files yet.
+    pub fn sync_regen_pending_file(&self) -> PathBuf {
+        self.root.join(".sync-regen-pending")
+    }
+
+    /// Marker recording that a sync the user caused has not been reported yet.
+    pub fn sync_report_pending_file(&self) -> PathBuf {
+        self.root.join(".sync-report-pending")
+    }
+
+    /// Marker recording that a first clone started restoring and has not finished.
+    pub fn sync_bootstrap_pending_file(&self) -> PathBuf {
+        self.root.join(".sync-bootstrap-pending")
+    }
+
+    /// Lock held briefly around anything that rewrites the store.
+    pub fn store_lock_file(&self) -> PathBuf {
+        self.root.join(".store.lock")
+    }
+
+    /// Marker asking the running sync for one more cycle.
+    pub fn sync_rerun_file(&self) -> PathBuf {
+        self.root.join(".sync-rerun")
+    }
+
     /// Create the data, categories, and shell directories if missing.
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(self.categories_dir())
@@ -157,6 +182,19 @@ mod tests {
         assert_eq!(
             p.sync_notified_file(),
             PathBuf::from("/tmp/cm/.sync-notified")
+        );
+        assert_eq!(
+            p.sync_regen_pending_file(),
+            PathBuf::from("/tmp/cm/.sync-regen-pending")
+        );
+        assert_eq!(
+            p.sync_report_pending_file(),
+            PathBuf::from("/tmp/cm/.sync-report-pending")
+        );
+        assert_eq!(p.sync_rerun_file(), PathBuf::from("/tmp/cm/.sync-rerun"));
+        assert_eq!(
+            p.sync_bootstrap_pending_file(),
+            PathBuf::from("/tmp/cm/.sync-bootstrap-pending")
         );
     }
 

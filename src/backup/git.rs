@@ -34,7 +34,13 @@ impl GitRepo {
             .with_context(|| format!("running git {}", args.join(" ")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git {} failed: {}", args.join(" "), stderr.trim());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = [stderr.trim(), stdout.trim()]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!("git {} failed: {detail}", args.join(" "));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -71,12 +77,36 @@ impl GitRepo {
 
     /// Stage everything and commit. Returns false when there was nothing to do.
     pub fn commit_all(&self, message: &str) -> Result<bool> {
-        self.run(&["add", "-A"])?;
-        if !self.has_changes_staged()? {
+        if !self.stage_all()? {
             return Ok(false);
         }
-        self.run(&["commit", "-m", message])?;
+        self.commit_staged(message)?;
         Ok(true)
+    }
+
+    /// Stage everything, returning whether there is anything to commit.
+    pub fn stage_all(&self) -> Result<bool> {
+        self.run(&["add", "-A"])?;
+        self.has_changes_staged()
+    }
+
+    pub fn commit_staged(&self, message: &str) -> Result<()> {
+        self.run(&["commit", "-m", message])?;
+        Ok(())
+    }
+
+    /// Merge `.gitignore` by keeping both sides' lines, so machines on different
+    /// versions never conflict over the list of bookkeeping files.
+    pub fn ensure_gitignore_merges_by_union(&self) -> Result<()> {
+        const RULE: &str = ".gitignore merge=union";
+        let path = self.workdir.join(".git/info/attributes");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|line| line.trim() == RULE) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.workdir.join(".git/info"))?;
+        std::fs::write(&path, format!("{existing}{RULE}\n"))?;
+        Ok(())
     }
 
     fn has_changes_staged(&self) -> Result<bool> {
@@ -128,17 +158,41 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Pull the latest from an explicit URL (used when credentials must be
-    /// embedded for a one-shot authenticated fetch). Non-interactive like [`pull`].
-    pub fn pull_url(&self, url: &str, branch: &str) -> Result<()> {
+    /// Fetch `branch` without touching the working tree. `source` is a remote
+    /// name or an explicit URL carrying one-shot credentials.
+    pub fn fetch(&self, source: &str, branch: &str) -> Result<()> {
+        self.run(&["fetch", source, branch])?;
+        Ok(())
+    }
+
+    /// Merge the last fetch into the working tree, leaving any merge commit for
+    /// [`GitRepo::conclude_merge`] so hooks and signing can run separately.
+    pub fn merge_fetched(&self) -> Result<()> {
         self.run(&[
-            "pull",
-            "--no-rebase",
+            "merge",
+            "--no-commit",
             "--no-edit",
             "--allow-unrelated-histories",
-            url,
-            branch,
+            "FETCH_HEAD",
         ])?;
+        Ok(())
+    }
+
+    /// Whether the working tree holds exactly what is staged, so nothing has
+    /// changed that discarding the index could lose.
+    pub fn tree_matches_index(&self) -> bool {
+        Command::new("git")
+            .args(["diff", "--quiet"])
+            .current_dir(&self.workdir)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Commit a merge left open by [`GitRepo::merge_fetched`], if there is one.
+    pub fn conclude_merge(&self) -> Result<()> {
+        if self.workdir.join(".git/MERGE_HEAD").exists() {
+            self.run(&["commit", "--no-edit"])?;
+        }
         Ok(())
     }
 
@@ -174,6 +228,14 @@ pub fn remote_has_content(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a remote answers at all, which an empty one does.
+pub fn remote_is_reachable(url: &str) -> bool {
+    Command::new("git")
+        .args(["ls-remote", url])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// Clone `url` into `dest`.
 pub fn clone(url: &str, dest: &Path) -> Result<()> {
     let output = Command::new("git")
@@ -200,6 +262,9 @@ mod tests {
         repo.run(&["config", "user.email", "test@example.com"])
             .unwrap();
         repo.run(&["config", "user.name", "Test"]).unwrap();
+        repo.run(&["config", "core.hooksPath", "/dev/null"])
+            .unwrap();
+        repo.run(&["config", "commit.gpgsign", "false"]).unwrap();
         repo
     }
 
@@ -263,6 +328,22 @@ mod tests {
         std::fs::write(&file, "x = 999\n").unwrap();
         repo.reset_hard().unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x = 1\n");
+    }
+
+    #[test]
+    fn a_deleted_or_edited_file_does_not_match_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = configured_repo(dir.path());
+        let file = dir.path().join("a.toml");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        repo.commit_all("first").unwrap();
+        assert!(repo.tree_matches_index());
+
+        std::fs::write(&file, "x = 2\n").unwrap();
+        assert!(!repo.tree_matches_index());
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(!repo.tree_matches_index());
     }
 
     #[test]

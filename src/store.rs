@@ -1,6 +1,10 @@
 //! Loading and saving the alias/function store as per-category TOML files.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -9,6 +13,61 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::model::{DEFAULT_CATEGORY, Entry, EntryKey};
 use crate::paths::Paths;
+
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+pub(crate) fn try_flock(file: &File, operation: libc::c_int) -> bool {
+    // SAFETY: the descriptor stays open for the duration of the call.
+    unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) == 0 }
+}
+
+/// Held across a reread-then-save and across a sync's commit and merge, so
+/// neither can see or overwrite half of the other's work.
+pub struct StoreLock {
+    file: File,
+}
+
+impl StoreLock {
+    pub fn acquire(paths: &Paths) -> Result<Self> {
+        paths.ensure_dirs()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(paths.store_lock_file())
+            .context("opening the store lock")?;
+        let deadline = Instant::now() + STORE_LOCK_WAIT;
+        while !try_flock(&file, libc::LOCK_EX) {
+            if Instant::now() >= deadline {
+                bail!("your entries are busy being updated; try again in a moment");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(StoreLock { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        try_flock(&self.file, libc::LOCK_UN);
+    }
+}
+
+/// Replace `path` in one step so a reader never sees a partial file. A symlinked
+/// file is written through instead, so it stays a symlink.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let is_symlink = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if is_symlink {
+        return std::fs::write(path, text).with_context(|| format!("writing {}", path.display()));
+    }
+    let temp = path.with_file_name(".store-write.tmp");
+    std::fs::write(&temp, text).with_context(|| format!("writing {}", temp.display()))?;
+    if let Ok(existing) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&temp, existing.permissions());
+    }
+    std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))
+}
 
 /// On-disk shape of a single category file: `[[entry]]` tables.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -158,33 +217,103 @@ impl Store {
                 .push(e.clone());
         }
 
-        // Remove category files that no longer have entries.
-        if dir.exists() {
-            for existing in std::fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
-                let path = existing.path();
-                if path.extension().map(|x| x == "toml").unwrap_or(false) {
-                    let stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !grouped.contains_key(&stem) {
-                        std::fs::remove_file(&path)
-                            .with_context(|| format!("removing {}", path.display()))?;
-                    }
+        // Written before anything is pruned, so a failed write cannot leave an
+        // entry in neither its old category nor its new one.
+        for (category, entries) in &mut grouped {
+            entries.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
+            let file = CategoryFile {
+                entry: entries.clone(),
+            };
+            let text = toml::to_string_pretty(&file)
+                .with_context(|| format!("serializing category '{category}'"))?;
+            write_atomic(&dir.join(format!("{category}.toml")), &text)?;
+        }
+
+        for existing in std::fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
+            let path = existing.path();
+            if path.extension().map(|x| x == "toml").unwrap_or(false) {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !grouped.contains_key(&stem) {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing {}", path.display()))?;
                 }
             }
         }
-
-        for (category, mut entries) in grouped {
-            entries.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.cmp(&b.name)));
-            let file = CategoryFile { entry: entries };
-            let text = toml::to_string_pretty(&file)
-                .with_context(|| format!("serializing category '{category}'"))?;
-            let path = dir.join(format!("{category}.toml"));
-            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn a_write_replaces_the_file_and_leaves_no_temporary_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.toml");
+        write_atomic(&target, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!dir.path().join(".store-write.tmp").exists());
+    }
+
+    #[test]
+    fn a_write_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.toml");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&target, "new").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_a_moved_entry_in_its_old_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        let entry = |category: &str| {
+            let mut e = Entry::new("moved", crate::model::Kind::Alias, "echo hi", "d");
+            e.category = category.to_string();
+            e
+        };
+        let mut store = Store::default();
+        store.add(entry("zeta")).unwrap();
+        store.save(&paths).unwrap();
+
+        let mut moved = Store::default();
+        moved.add(entry("alpha")).unwrap();
+        let blocker = paths.categories_dir().join(".store-write.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(moved.save(&paths).is_err());
+
+        assert!(paths.categories_dir().join("zeta.toml").exists());
+    }
+
+    #[test]
+    fn a_symlinked_file_stays_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_atomic(&link, "through").unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "through");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn the_store_lock_is_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_root(dir.path().to_path_buf());
+        let held = StoreLock::acquire(&paths).unwrap();
+        let other = File::open(paths.store_lock_file()).unwrap();
+        assert!(!try_flock(&other, libc::LOCK_EX));
+        drop(held);
+        assert!(try_flock(&other, libc::LOCK_EX));
     }
 }
 

@@ -17,6 +17,7 @@ pub enum Action {
     },
     Reload,
     Backup,
+    SyncNow,
     /// Advance the scope filter; needs the App for the scope registry.
     CycleScope,
     Delete(EntryKey),
@@ -32,6 +33,8 @@ pub enum Action {
         placement: Placement,
         /// Whether to auto-fill empty help fields before saving.
         autofill: bool,
+        /// The version an edit started from, so a newer one is not reverted.
+        opened: Option<Box<Entry>>,
     },
 }
 
@@ -49,6 +52,12 @@ pub enum Mode {
     Search,
     Confirm { kind: ConfirmKind, message: String },
     Help,
+    SyncFailure { report: String },
+}
+
+/// A sync the user asked for from the TUI, and the attempt it has to replace.
+pub struct PendingSync {
+    pub before: Option<String>,
 }
 
 /// Full TUI state.
@@ -67,6 +76,12 @@ pub struct UiState {
     active: Vec<String>,
     pub mode: Mode,
     pub status: String,
+    pub pending_sync: Option<PendingSync>,
+    /// Why the last form submission failed, for the form to show.
+    pub form_error: Option<String>,
+    pub popup_scroll: u16,
+    /// The failing stage the popup last showed, so a repeat need not interrupt.
+    pub last_failure_stage: Option<String>,
 }
 
 impl UiState {
@@ -84,6 +99,10 @@ impl UiState {
             active: Vec::new(),
             mode: Mode::Browse,
             status: "? for help".to_string(),
+            pending_sync: None,
+            form_error: None,
+            popup_scroll: 0,
+            last_failure_stage: None,
         };
         state.set_entries(app);
         state
