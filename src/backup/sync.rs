@@ -687,28 +687,33 @@ fn readable_cause(message: &str) -> String {
 /// What went wrong and what to do, in terms of the causes people can act on.
 fn why_and_fix(status: &SyncStatus, text: &FailureText) -> (String, &'static str) {
     let message = &status.message;
-    if mentions_any(
-        message,
-        &[
-            "Could not resolve host",
-            "Network is unreachable",
-            "Connection refused",
-            "Connection timed out",
-        ],
-    ) {
+    let reached_for_the_remote = status.outcome != OUTCOME_COMMIT_FAILED;
+    if reached_for_the_remote
+        && mentions_any(
+            message,
+            &[
+                "Could not resolve host",
+                "Network is unreachable",
+                "Connection refused",
+                "Connection timed out",
+            ],
+        )
+    {
         return (NETWORK_WHY.to_string(), NETWORK_FIX);
     }
-    if mentions_any(
-        message,
-        &[
-            "could not read Username",
-            "Authentication failed",
-            "returned error: 403",
-        ],
-    ) {
+    if reached_for_the_remote
+        && mentions_any(
+            message,
+            &[
+                "could not read Username",
+                "Authentication failed",
+                "returned error: 403",
+            ],
+        )
+    {
         return (SIGN_IN_WHY.to_string(), SIGN_IN_FIX);
     }
-    if message.contains("Permission denied (publickey)") {
+    if reached_for_the_remote && message.contains("Permission denied (publickey)") {
         return (SIGN_IN_WHY.to_string(), SSH_KEY_FIX);
     }
     if message.contains("duplicate entry") {
@@ -1192,6 +1197,20 @@ mod tests {
     fn fix_for(message: &str) -> (String, &'static str) {
         let status = SyncStatus::new("t1", OUTCOME_PULL_FAILED, message);
         why_and_fix(&status, &failure_text(OUTCOME_PULL_FAILED).unwrap())
+    }
+
+    #[test]
+    fn a_commit_failure_is_never_blamed_on_the_remote() {
+        let status = SyncStatus::new(
+            "t1",
+            OUTCOME_COMMIT_FAILED,
+            "git commit failed: hook: Connection refused; Permission denied (publickey); Authentication failed",
+        );
+        let text = failure_text(OUTCOME_COMMIT_FAILED).unwrap();
+        let (why, fix) = why_and_fix(&status, &text);
+        assert_ne!(why, NETWORK_WHY);
+        assert_ne!(why, SIGN_IN_WHY);
+        assert_eq!(fix, text.fix);
     }
 
     #[test]

@@ -123,6 +123,21 @@ fn install_hook(paths: &Paths, name: &str, script: &str) {
 const REJECT_LOWERCASE_SUBJECT: &str =
     "#!/bin/sh\ncase \"$(head -n 1 \"$1\")\" in\n  [[:lower:]]*) exit 1 ;;\nesac\n";
 
+const REQUIRE_IMPERATIVE_SUBJECT: &str = r#"#!/bin/sh
+subject=$(head -n 1 "$1")
+case "$subject" in
+  [[:lower:]]* | *.) exit 1 ;;
+esac
+if printf '%s\n' "$subject" | grep -Eq '^[A-Za-z]+(\([^)]*\))?!?:'; then
+  exit 1
+fi
+case "${subject%% *}" in
+  *s | *ed | *ing) exit 1 ;;
+esac
+"#;
+
+const REJECT_SAYING_CONNECTION_REFUSED: &str = "#!/bin/sh\necho 'Commit rejected: the subject line does not follow the format.' >&2\necho 'Connection refused' >&2\nexit 1\n";
+
 fn notice_after_failed_sync(paths: &Paths, config: &Config, outcome: &str) -> String {
     sync_expecting(paths, config, "2026-08-16T00:01:00Z", outcome);
     backup::take_failure_notice(paths).expect("a failed sync should produce a notice")
@@ -163,6 +178,49 @@ fn manual_backup_commit_passes_a_capitalized_subject_hook() {
     let report =
         backup::run_backup(&paths, &config_with_remote(url), "2026-08-16T00:00:00Z").unwrap();
     assert!(report.committed);
+}
+
+#[test]
+fn backup_commits_pass_a_capitalized_imperative_subject_hook() {
+    ensure_git_identity();
+    let bare = bare_remote();
+    let url = bare.path().to_str().unwrap();
+
+    let home = TempDir::new().unwrap();
+    let paths = Paths::with_root(home.path().to_path_buf());
+    seed_store(&paths, "gitsw", "git switch");
+    backup::prepare_repo(&paths).unwrap();
+    install_commit_msg_hook(&paths, REQUIRE_IMPERATIVE_SUBJECT);
+
+    sync_expecting(
+        &paths,
+        &config_with_remote(url),
+        "2026-08-16T00:00:00Z",
+        "ok",
+    );
+
+    seed_store_in(&paths, "gco", "git checkout", "git");
+    let report =
+        backup::run_backup(&paths, &config_with_remote(url), "2026-08-16T00:00:01Z").unwrap();
+    assert!(report.committed);
+}
+
+#[test]
+fn a_hook_rejection_mentioning_the_network_is_still_a_commit_failure() {
+    ensure_git_identity();
+    let bare = bare_remote();
+    let url = bare.path().to_str().unwrap();
+
+    let home = TempDir::new().unwrap();
+    let paths = Paths::with_root(home.path().to_path_buf());
+    seed_store(&paths, "gitsw", "git switch");
+    backup::prepare_repo(&paths).unwrap();
+    install_commit_msg_hook(&paths, REJECT_SAYING_CONNECTION_REFUSED);
+
+    let notice = notice_after_failed_sync(&paths, &config_with_remote(url), "commit-failed");
+    assert!(notice.contains("could not commit your changes"), "{notice}");
+    assert!(!notice.contains("could not reach"), "{notice}");
+    assert!(!notice.contains("Reconnect"), "{notice}");
 }
 
 #[test]
